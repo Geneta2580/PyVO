@@ -1,0 +1,10 @@
+# --- 您的特殊要求 ---
+# 忽略所有 .txt 输出文件
+*.txt
+# 如果您想保留说明文档（如 README.txt），可以取消下面这一行的注释：
+# !README.txt
+
+# --- Python 缓存与临时文件 ---
+__pycache__/
+
+/submodules/
