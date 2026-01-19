@@ -6,7 +6,7 @@ import multiprocessing as mp
 
 import cv2
 from utils.dataloader import UnifiedDataloader
-from core.manager import SLAMManager
+from core.slam_manager import SLAMManager
 
 class DataloaderWrapper:
     def __init__(self, dataloader):

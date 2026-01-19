@@ -1,0 +1,15 @@
+# ninja log v5
+0	2573	0	/home/geneta/project/ivggt/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/adam.o	da155863ac4a891a
+1	2979	0	/home/geneta/project/ivggt/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/backward.o	a4af78caed0a5725
+1	4972	0	/home/geneta/project/ivggt/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/forward.o	988b7d04af40ff87
+1	9397	0	/home/geneta/project/ivggt/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/rasterizer_impl.o	5df544e5a50c5a12
+1	14420	0	/home/geneta/project/ivggt/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/ext.o	8a4456fe78c708cc
+1	43648	0	/home/geneta/project/ivggt/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/rasterize_points.o	36c67eff17a29db3
+0	44419	0	/home/geneta/project/ivggt/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/conv.o	defb9f36ca11f3f4
+1	9944	0	/home/geneta/project/ivggt/submodules/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/ext.o	4defc5c4e24d8cf1
+10	1823	0	/home/geneta/project/ivggt/submodules/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/adam.o	56a9b2b8c5dd4d16
+10	2022	0	/home/geneta/project/ivggt/submodules/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/backward.o	97972a39e4c55e21
+10	3341	0	/home/geneta/project/ivggt/submodules/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/forward.o	605701a34a1a6974
+10	6422	0	/home/geneta/project/ivggt/submodules/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/cuda_rasterizer/rasterizer_impl.o	f1be59179e9e1c0a
+11	33802	0	/home/geneta/project/ivggt/submodules/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/rasterize_points.o	fe310b1c321aeec1
+9	33971	0	/home/geneta/project/ivggt/submodules/diff-surfel-rasterization/build/temp.linux-x86_64-cpython-310/conv.o	8a7844b7c0a39773

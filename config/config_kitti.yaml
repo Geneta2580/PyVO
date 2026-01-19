@@ -36,3 +36,17 @@ clahe_value: 2.0
 # KLT参数
 window_size: 9
 pyramid_levels: 3
+nmax_iters: 30 # KLT最大迭代次数
+klt_err: 0.01 # KLT误差阈值
+max_fb_dist: 1.0 # 前后向追踪的FB距离阈值
+
+# 使用运动模型预测光流
+klt_use_prior: True
+
+# RANSAC相关参数
+do_random: True
+ransac_iter: 100
+ransac_err: 3.0
+
+# 初始化判定视差阈值
+init_parallax: 20.0
