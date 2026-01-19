@@ -8,5 +8,4 @@
 __pycache__/
 
 
-submodules/
-#.pt
+*.pt
