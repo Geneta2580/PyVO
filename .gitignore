@@ -7,4 +7,6 @@
 # --- Python 缓存与临时文件 ---
 __pycache__/
 
-/submodules/
+
+submodules/
+#.pt
