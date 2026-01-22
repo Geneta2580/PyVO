@@ -33,7 +33,7 @@ class MotionModel:
 
     def update_motion_model(self, T_wc_np, time):
         current_T_wc = gtsam.Pose3(T_wc_np)
-        Debugger.log_trajectory_tum(self.traj_file, time, current_T_wc)
+        Debugger.log_pose_tum(self.traj_file, time, current_T_wc)
         if self.prev_time > 0:
             dt = time - self.prev_time
             if dt > 1e-6:
@@ -839,8 +839,13 @@ class VisualFrontend:
             print(f"[VisualFrontEnd Compute Pose] P3P RANSAC success: {success}")
             print(f"[VisualFrontEnd Compute Pose] P3P RANSAC inliers: {n_inliers}")
 
+            self.logger.log_flexible(self.cur_frame.timestamp, "p3p_ransac_inliers_count", n_inliers)
+            self.logger.log_flexible(self.cur_frame.timestamp, "p3p_ransac_inliers_count_ratio", n_inliers / len(np_bvs))
+
             if not success or n_inliers < 5:
                 print("[VisualFrontEnd Compute Pose] P3P Failed or not enough inliers. Resetting.")
+                self.logger.log_flexible(self.cur_frame.timestamp, "p3p_ransac_inliers_count", 0)
+                self.logger.log_flexible(self.cur_frame.timestamp, "p3p_ransac_inliers_count_ratio", 0.0)
                 # 此时cur_frame.T_w_c，还是使用的运动模型预测位姿
                 # TODO：reset？
                 # self.reset_frame() 
@@ -875,10 +880,15 @@ class VisualFrontend:
         
         print(f"[VisualFrontEnd Compute Pose] GTSAM PnP Outliers: {len(outliers_idx)} / {len(np_kps)}")
 
+        self.logger.log_flexible(self.cur_frame.timestamp, "gtsam_pnp_inliers_count", n_inliers)
+        self.logger.log_flexible(self.cur_frame.timestamp, "gtsam_pnp_inliers_count_ratio", n_inliers / len(np_kps))
+
         # 检查优化结果有效性
         if not success or n_inliers < 5 or len(outliers_idx) > 0.5 * len(np_kps):
             # 如果单目模式下 P3P 后优化依然挂了，重置
             print("[VisualFrontEnd Compute Pose] Optimization failed after P3P. Resetting.")
+            self.logger.log_flexible(self.cur_frame.timestamp, "gtsam_pnp_inliers_count", 0)
+            self.logger.log_flexible(self.cur_frame.timestamp, "gtsam_pnp_inliers_count_ratio", 0.0)
             # self.reset_frame()
             return
 
@@ -980,6 +990,13 @@ class VisualFrontend:
 
         # 最终判断: 满足任意核心条件 (c0/c1/c2) 且 满足基础视差条件 (cx)
         is_kf_required = (c0 or c1 or c2) and cx
+
+        self.logger.log_flexible(self.cur_frame.timestamp, "id", self.cur_frame.get_id())
+        self.logger.log_flexible(self.cur_frame.timestamp, "ref_kf_id", self.cur_frame.ref_kf_id)
+        self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_is_kf_required", is_kf_required)
+        self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_med_rot_parallax", med_rot_parallax)
+        self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_n_frames_since_kf", n_frames_since_kf)
+        self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_n_visual_features_num", visual_features_num)
 
         if is_kf_required:
             print(f"-------------------------------------------------------------------")
