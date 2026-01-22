@@ -3,260 +3,444 @@ import numpy as np
 import cv2
 import gtsam
 from utils.geometry import MultiViewGeometry
+from utils.visualization import visualize_optical_flow_tracking
+from datatype.mappoint import MapPointStatus
+from utils.debug import Debugger
 
 # 运动模型
 class MotionModel:
     def __init__(self, config):
         self.config = config
         self.prev_time = -1
-        self.prev_T_wc = None
-        self.log_rel_T_wc = gtsam.Pose3()
+        self.prev_T_wc = None  # 存储为 gtsam.Pose3 对象
+        # 存储速度矢量 (6x1: rotation + translation)
+        self.log_rel_T_wc = np.zeros(6)
+        self.traj_file = Debugger.initialize_trajectory_file("/output/trajectory_tum.txt")
 
-
-    def apply_motion_model(self, T_wc, time):
-        # 非第一帧
+    def apply_motion_model(self, T_wc_np, time):
+        T_wc = gtsam.Pose3(T_wc_np)
         T_wc_pred = T_wc
-        if self.prev_time > 0:
-            relative_pose = self.prev_T_wc.between(T_wc)
-            error_vector = gtsam.Pose3.Logmap(relative_pose)
-            if not np.allclose(error_vector, 0, atol=1e-5):
-                self.prev_T_wc = T_wc # 保持静止
 
-            # 恒速模型预测位姿
+        if self.prev_time > 0:
             dt = time - self.prev_time
+            
+            # 恒速模型预测：T_pred = T_curr * Expmap(velocity * dt)
             delta_pose = gtsam.Pose3.Expmap(self.log_rel_T_wc * dt)
             T_wc_pred = T_wc.compose(delta_pose)
-                        
-        return T_wc_pred
+            print(f"[MotionModel] apply_motion_model: {T_wc_pred.matrix()}")
 
-    def update_motion_model(self, T_wc, time):
+        return T_wc_pred.matrix()
+
+    def update_motion_model(self, T_wc_np, time):
+        current_T_wc = gtsam.Pose3(T_wc_np)
+        Debugger.log_trajectory_tum(self.traj_file, time, current_T_wc)
+        if self.prev_time > 0:
+            dt = time - self.prev_time
+            if dt > 1e-6:
+                # 计算相对变换：prev_T^{-1} * curr_T (从上一帧到当前帧的增量)
+                print(f"[MotionModel] prev_T_wc: {self.prev_T_wc.matrix()}")
+                print(f"[MotionModel] current_T_wc: {current_T_wc.matrix()}")
+                relative_pose = self.prev_T_wc.between(current_T_wc)
+                # v = Logmap(T_rel) / dt
+                print(f"[MotionModel] Update relative_pose: {relative_pose.matrix()}")
+                self.log_rel_T_wc = gtsam.Pose3.Logmap(relative_pose) / dt
+                print(f"[MotionModel] log_rel_T_wc: {self.log_rel_T_wc}")
+
+        # 更新历史状态
         self.prev_time = time
-        self.prev_T_wc = T_wc
+        self.prev_T_wc = current_T_wc
 
 
 class VisualFrontend:
-    def __init__(self, config, prev_frame, cur_frame, map_manager, feature_tracker):
+    def __init__(self, config, prev_frame, cur_frame, map_manager, feature_tracker, feature_extractor, mapper=None):
         self.config = config
+        self.prev_frame = prev_frame
         self.cur_frame = cur_frame
-        self.prev_pyramid = None
-        self.curr_pyramid = None
 
         # 调用
-        self.tracker = feature_tracker
         self.map_manager = map_manager
+        self.feature_tracker = feature_tracker
+        self.feature_extractor = feature_extractor
+        self.mapper = mapper
 
         # 运动模型（恒速模型）
         self.motion_model = MotionModel(config)
 
         # 是否完成视觉初始化
-        self.visual_init = False
+        self.visual_init_ready = False
 
         # 初始化CLAHE参数
         tile_size = 50
-        self.nbwtiles = self.cur_frame.camera_calibration.img_w / tile_size
-        self.nbhtiles = self.cur_frame.camera_calibration.img_h / tile_size
-        self.clahe = cv2.createCLAHE(clipLimit=config['clahe_value'], tileGridSize=(self.nbwtiles, self.nbhtiles))
+        self.nbwtiles = self.cur_frame.camera.img_w / tile_size
+        self.nbhtiles = self.cur_frame.camera.img_h / tile_size
+        self.clahe = cv2.createCLAHE(clipLimit=config['clahe_value'], tileGridSize=(int(self.nbwtiles), int(self.nbhtiles)))
 
-    def visual_tracking(self, image, timestamp):
+        # 预处理的灰度图
+        self.prev_gray = None
+
+        # 是否使用P3P
+        self.do_p3p = False
+        
+        # 可视化选项
+        self.visualize_optical_flow = config.get('visualize_optical_flow', False)
+        
+        # 存储追踪数据用于可视化
+        self.tracking_prev_pts = None
+        self.tracking_tracked_pts = None
+        self.tracking_final_status = None
+        self.tracking_kp_ids = None  # 保存特征点ID用于内点映射
+
+        # 日志
+        log_columns = [
+            "timestamp",
+            "visual_tracking_is_new_kf",
+            "visual_tracking_n_tracked_valid_3d",
+            "visual_tracking_n_tracked_valid_3d_ratio",
+            "visual_tracking_n_tracked_valid_3d_ratio",
+        ]
+        self.logger = Debugger(config, file_prefix="visual_frontend", column_names=log_columns)
+
+    def reset(self):
+        """
+        重置视觉前端状态，用于初始化失败时的重置
+        """
+        print(f"[VisualFrontend] Resetting visual frontend state")
+        self.visual_init_ready = False
+        self.prev_frame = None
+        self.prev_gray = None
+        self.do_p3p = False
+        
+        # 重置运动模型
+        self.motion_model.prev_time = -1
+        self.motion_model.prev_T_wc = None
+        self.motion_model.log_rel_T_wc = np.zeros(6)
+        
+        print(f"[VisualFrontend] Reset complete")
+
+    # def reset_frame(self):
+    #     self.cur_frame.
+
+    def visual_tracking(self, prev_frame, cur_frame, timestamp):
         print(f"[VisualFrontend] Mono tracking: {timestamp}")
 
-        # 预处理图像
-        self.preprocess_image(image)
+        self.prev_frame = prev_frame
+        self.cur_frame = cur_frame
 
-        # 第一帧直接作为关键帧
-        if self.frame.id == 0:
-            return True
+        # 预处理图像
+        curr_gray = self.preprocess_image(cur_frame.image)
+
+        # 第一帧直接作为关键帧（ID为0或prev_frame为None都认为是第一帧）
+        if self.prev_frame is None:
+            print(f"[VisualFrontend] First frame, ready for keyframe creation...")
+            # 第一帧作为关键帧，ref_kf_id 设置为自己的ID
+            self.cur_frame.ref_kf_id = self.cur_frame.get_id()
+
+            # 第一帧更新运动模型（单位阵，时间戳）
+            self.motion_model.update_motion_model(self.cur_frame.get_T_w_c(), timestamp)
+
+            self.prev_frame = self.cur_frame
+            self.prev_gray = curr_gray
+            return True, curr_gray
+
+        # 设置参考关键帧：普通帧继承上一帧的参考关键帧
+        if self.prev_frame is not None:
+            self.cur_frame.ref_kf_id = self.prev_frame.ref_kf_id
+        else:
+            assert False, "[VisualFrontend] [Error]: Previous frame should not be None"
 
         # 预测新帧位姿
-        T_wc = self.cur_frame.get_T_w_c()
-        T_wc_pred = self.motion_model.apply_motion_model(T_wc, timestamp)
+        # 应该基于上一帧的位姿进行预测，而不是新帧的初始位姿（单位矩阵）
+        if self.prev_frame is not None:
+            T_wc_prev = self.prev_frame.get_T_w_c()
+        else:
+            assert False, "[VisualFrontend] [Error]: Previous frame should not be None"
+            T_wc_prev = np.eye(4)
+        
+        T_wc_pred = self.motion_model.apply_motion_model(T_wc_prev, timestamp)
         self.cur_frame.set_T_w_c(T_wc_pred)
 
         # 追踪新帧
-        self.KLT_tracking()
+        n_tracked_valid_3d = self.KLT_tracking(self.prev_gray, curr_gray)
 
-        # 对极约束去除外点
-        self.epipolar_filtering()
+        # 对极约束去除外点（有必要则使用E矩阵更新位姿，否则直接使用运动模型预测的位姿）
+        self.epipolar_filtering(n_tracked_valid_3d)
 
         # 检查视觉初始化准备是否完成
-        if not self.visual_init:
-            if(self.cur_frame.nb2dkps < 50):
-                # TODO: 重置，重新初始化
-                return False
+        if not self.visual_init_ready:
+            # 经过光流追踪和对极约束去除外点后，特征点数量仍然较少，无法进行视觉初始化
+            if(len(self.cur_frame.get_visual_feature_ids()) < 50):
+                return False, curr_gray
             elif self.check_ready_for_init():
                 print(f'[VisualFrontend] Ready for visual initialization!')
-                self.visual_init = True
+                self.visual_init_ready = True
+
+                # 第二帧更新运动模型（初始位姿，时间戳）
+                self.motion_model.update_motion_model(self.cur_frame.get_T_w_c(), timestamp)
+                return True, curr_gray # 直接返回True，不进行后续处理
             else:
                 print(f'[VisualFrontend] Not ready for visual initialization!')
-                return False
+                return False, curr_gray
 
         # 计算位姿
-        self.compute_pose()
+        self.compute_pose(n_tracked_valid_3d)
 
         # 更新运动模型
         self.motion_model.update_motion_model(self.cur_frame.get_T_w_c(), timestamp)
 
-        # 检查是否为新关键帧
-        is_new_kf = self.check_new_keyframe()
+        # 检查是否为新关键帧（只判断，不创建）
+        is_new_kf = self.check_new_keyframe(n_tracked_valid_3d)
 
-        return is_new_kf
+        # 更新
+        self.prev_frame = self.cur_frame
+        self.prev_gray = curr_gray
 
-    def preprocess_image(self, image):
+        # 返回关键帧判断结果和灰度图（用于后续关键帧创建）
+        return is_new_kf, curr_gray
+
+    def preprocess_image(self, cur_image):
         print(f"[VisualFrontend] Preprocessing image")
+        curr_gray = cv2.cvtColor(cur_image, cv2.COLOR_BGR2GRAY)
+        # 使用直方图均衡化增强图像对比度(注意opencv要求)
+        clahe_curr_image = self.clahe.apply(curr_gray)
+        curr_gray = clahe_curr_image
 
-        # 使用直方图均衡化增强图像对比度
-
+        return curr_gray
         
-
-    def KLT_tracking(self, image, timestamp):
-
-        # 追踪3d点2层
-        # 追踪2d点全层
+    def KLT_tracking(self, prev_gray, curr_gray):
+        print(f"[VisualFrontend] KLT Tracking")
+        # 追踪3d点2层/追踪2d点全层
         # 准备数据容器
-        v3d_kp_ids = []
-        v3d_kps_px = [] # 像素坐标
-        v3d_priors = [] # 预测坐标
+        valid_3d_kp_ids = []
+        valid_3d_kps_px = [] # 像素坐标
+        valid_3d_priors = [] # 预测坐标
         
-        v_kp_ids = []
-        v_kps_px = []
-        v_priors = []        
+        valid_2d_kp_ids = []
+        valid_2d_kps_px = []
+        valid_2d_priors = []        
 
-        current_kps = self.cur_frame.get_keypoints()
+        prev_kps_ids = self.prev_frame.get_visual_feature_ids()
+        prev_kps_features = self.prev_frame.get_visual_features()
 
-        for kp in current_kps:
-            has_prior = False
+        for kp_id, kp_px in zip(prev_kps_ids, prev_kps_features):
+            map_point = self.map_manager.get_map_point(kp_id)
+            flat_kp = kp_px.flatten() # (1, 2) -> (2,)
+            if map_point is not None and map_point.status == MapPointStatus.TRIANGULATED:
+                # 投影: World -> Image (Distorted) 这里的 T_cw是基于恒速模型预测的位姿
+                proj_px = self.cur_frame.camera.project_world_to_image(self.cur_frame.get_T_w_c(), map_point.get_point())
 
-            if self.config['klt_use_prior'] and kp.is3d:
-                # 获取该特征点对应的历史地图点
-                map_point = self.map_manager.get_map_point(kp.lmid)
+                # 检查投影点是否在图像内
+                if self.cur_frame.camera.is_in_image(proj_px):
+                    valid_3d_kps_px.append(flat_kp)
+                    valid_3d_priors.append(proj_px.flatten())
+                    valid_3d_kp_ids.append(kp_id)
+                    continue # 找到一个先验即可
 
-                if map_point:
-                    # 投影: World -> Image (Distorted) 这里的 T_cw是基于恒速模型预测的位姿
-                    proj_px = self.cur_frame.proj_world_to_image(map_point.get_point())
+                # 特征点不在图像内，加入到普通列表，稍后尝试全金字塔跟踪
+                else:
+                    valid_2d_kps_px.append(flat_kp)
+                    valid_2d_priors.append(flat_kp) # 使用上一帧对应点的像素坐标作为预测坐标
+                    valid_2d_kp_ids.append(kp_id)
 
-                    # 检查投影点是否在图像内
-                    if self.cur_frame.is_in_image(proj_px):
-                        v3d_kps_px.append(kp.px)
-                        v3d_priors.append(proj_px)
-                        v3d_kp_ids.append(kp.lmid)
-                        has_prior = True
-                        continue # 找到一个先验即可
+            # 特征点不在地图中，加入到普通列表，稍后尝试全金字塔跟踪
+            else:
+                valid_2d_kps_px.append(flat_kp)
+                valid_2d_priors.append(flat_kp)
+                valid_2d_kp_ids.append(kp_id)
 
-            if not has_prior:
-                v_kps_px.append(kp.px)
-                v_priors.append(kp.px) # 使用上一帧对应点的像素坐标作为预测坐标
-                v_kp_ids.append(kp.lmid)
-        
-        # 转换为 numpy 格式以供 OpenCV 使用
-        np_v3d_kps = np.array(v3d_kps_px, dtype=np.float32)
-        np_v3d_priors = np.array(v3d_priors, dtype=np.float32)
-        
-        np_v_kps = np.array(v_kps_px, dtype=np.float32)
-        np_v_priors = np.array(v_priors, dtype=np.float32)
+        print(f"[VisualFrontend KLT Tracking] Valid 3D points: {len(valid_3d_kp_ids)}")
+        self.logger.log_flexible(self.cur_frame.timestamp, "visual_tracking_constant_vel_prior_valid_3d", len(valid_3d_kp_ids))
 
         # ---------------------------------------------------------
         # Step 1: 跟踪带有先验的 3D 点
         # ---------------------------------------------------------
-        if len(np_v3d_kps) > 0:
-            pyramid_levels = 1
+        # 用于可视化的数据收集
+        all_prev_pts = []
+        all_tracked_pts = []
+        all_final_status = []
+        all_kp_ids = []  # 保存特征点ID用于后续内点映射
+        nb_good_3d = 0 # 跟踪到的 3D 点数量
+        
+        if len(valid_3d_kp_ids) > 0:
+            # 在传入追踪器之前，将 list 转为 numpy array
+            np_3d_kps = np.array(valid_3d_kps_px, dtype=np.float32).reshape(-1, 2)
+            np_3d_priors = np.array(valid_3d_priors, dtype=np.float32).reshape(-1, 2)
+
             # 3D 点通常只在较小的金字塔层级上跟踪(代码中 nbpyrlvl=1)，因为预测比较准
-            tracked_pts, status = self.tracker.fb_klt_tracking(
-                self.prev_pyramid, self.curr_pyramid,
-                np_v3d_kps,
-                np_v3d_priors,
+            pyramid_levels = 1
+            tracked_pts, status = self.feature_tracker.fb_klt_tracking(
+                prev_gray, curr_gray,
+                np_3d_kps,
+                np_3d_priors,
                 pyramid_levels,
             )
 
-            nb_good = 0
+            # 收集3D点追踪数据用于可视化
+            all_prev_pts.extend(valid_3d_kps_px)
+            all_tracked_pts.extend(tracked_pts)
+            all_final_status.extend(status)
+            all_kp_ids.extend(valid_3d_kp_ids)
 
             # 处理跟踪结果
+            tracked_3d_list = []
+            ids_3d_list = []
+            ages_3d_list = []
+
             for i, is_good in enumerate(status):
-                lmid = v3d_kp_ids[i]
+                kp_id = valid_3d_kp_ids[i]
                 if is_good:
-                    # 跟踪成功：更新帧中特征点的坐标
-                    self.cur_frame.update_keypoint(lmid, tracked_pts[i])
-                    nb_good += 1
+                    # 添加跟踪成功点的的位置/id/age
+                    # 从上一帧获取 age，如果上一帧也没有（新特征点），age 从 1 开始
+                    prev_age = self.prev_frame.get_feature_age(kp_id) if self.prev_frame else None
+                    update_age = (prev_age + 1) if prev_age is not None else 1
+
+                    tracked_3d_list.append(tracked_pts[i])
+                    ids_3d_list.append(kp_id)
+                    ages_3d_list.append(update_age)
+                    nb_good_3d += 1
                 else:
                     # 跟踪失败：降级处理，加入到普通列表，稍后尝试全金字塔跟踪
-                    v_kps_px.append(v3d_kps_px[i]) # 使用原始像素
-                    v_priors.append(v3d_priors[i])
-                    v_kp_ids.append(lmid)
+                    valid_2d_kps_px.append(valid_3d_kps_px[i]) # 使用原始像素
+                    valid_2d_priors.append(valid_3d_priors[i])
+                    valid_2d_kp_ids.append(kp_id)
 
-            print(f"[VisualFrontend] Tracked {nb_good} / {len(np_v3d_kps)} 3D points")
-            if nb_good < 0.33 * len(np_v3d_kps):
-                # TODO:匀速模型预测的位姿不够准确，需要进行P3P
-                # TODO:不使用先验，使用原始像素作为预测坐标
-                self.bp3p_req = True
-                v_priors = v_kps_px
+            if tracked_3d_list:
+                self.cur_frame.add_visual_features(
+                    np.array(tracked_3d_list), 
+                    np.array(ids_3d_list), 
+                    np.array(ages_3d_list)
+                )
 
-            # 收集先验追踪失败点到普通追踪点
-            np_v_kps = np.array(v_kps_px, dtype=np.float32)
-            np_v_priors = np.array(v_priors, dtype=np.float32)
+            print(f"[VisualFrontend KLT Tracking] Tracked {nb_good_3d} / {len(valid_3d_kps_px)} 3D points")
+            self.logger.log_flexible(self.cur_frame.timestamp, "visual_tracking_3d_tracked_count", nb_good_3d)
+            self.logger.log_flexible(self.cur_frame.timestamp, "visual_tracking_3d_tracked_ratio", nb_good_3d / len(valid_3d_kps_px))
+
+            if nb_good_3d < 0.33 * len(valid_3d_kps_px):
+                self.do_p3p = True
+                valid_2d_priors = valid_2d_kps_px
 
         # ---------------------------------------------------------
         # Step 2: 跟踪未带有先验的 2D 点
         # ---------------------------------------------------------
-        if len(np_v_kps) > 0:
-            tracked_pts, status = self.tracker.fb_klt_tracking(
-                self.prev_pyramid, self.curr_pyramid,
-                np_v_kps,
-                np_v_priors,
-                self.config['pyramid_levels'],
+        # 这里似乎使用3层金字塔跟踪
+        nb_good_2d = 0 # 跟踪到的 2D 点数量
+        if len(valid_2d_kps_px) > 0:
+            np_2d_kps = np.array(valid_2d_kps_px, dtype=np.float32).reshape(-1, 2)
+            np_2d_priors = np.array(valid_2d_priors, dtype=np.float32).reshape(-1, 2)
+            tracked_pts, status = self.feature_tracker.fb_klt_tracking(
+                prev_gray, curr_gray,
+                np_2d_kps,
+                np_2d_priors,
+                3,
             )
 
-            nb_good = 0
+            # 收集2D点追踪数据用于可视化
+            all_prev_pts.extend(np_2d_kps)
+            all_tracked_pts.extend(tracked_pts)
+            all_final_status.extend(status)
+            all_kp_ids.extend(valid_2d_kp_ids)
+
+            tracked_2d_list = []
+            ids_2d_list = []
+            ages_2d_list = []
             for i, is_good in enumerate(status):
-                lmid = v_kp_ids[i]
+                kp_id = valid_2d_kp_ids[i]
                 if is_good:
-                    self.cur_frame.update_keypoint(lmid, tracked_pts[i])
-                    nb_good += 1
+                    # 从上一帧获取 age，如果上一帧也没有（新特征点），age 从 1 开始
+                    prev_age = self.prev_frame.get_feature_age(kp_id) if self.prev_frame else None
+                    update_age = (prev_age + 1) if prev_age is not None else 1
+
+                    tracked_2d_list.append(tracked_pts[i])
+                    ids_2d_list.append(kp_id)
+                    ages_2d_list.append(update_age)
+                    nb_good_2d += 1
                 else:
-                    # 彻底丢失追踪点，从 MapManager/CurrentFrame 中移除该观测
-                    self.map_manager.remove_obs_from_cur_frame(lmid)
-                    self.cur_frame.remove_keypoint_by_id(lmid)
+                    # 不添加跟踪失败点的的位置/id/age
+                    continue
+            
+            if tracked_2d_list:
+                self.cur_frame.add_visual_features(
+                    np.array(tracked_2d_list), 
+                    np.array(ids_2d_list), 
+                    np.array(ages_2d_list)
+                )
 
-            print(f"[VisualFrontend] KLT Tracking no prior: {nb_good} / {len(np_v_kps)} points.")
+            print(f"[VisualFrontend KLT Tracking] no prior: {nb_good_2d} / {len(valid_2d_kps_px)} points.")
+            self.logger.log_flexible(self.cur_frame.timestamp, "visual_tracking_2d_tracked_count", nb_good_2d)
+            self.logger.log_flexible(self.cur_frame.timestamp, "visual_tracking_2d_tracked_ratio", nb_good_2d / len(valid_2d_kps_px))
+        
+        # 可视化光流追踪结果（追踪后，对极约束前）
+        if self.visualize_optical_flow and len(all_prev_pts) > 0:
+            all_prev_pts = np.array(all_prev_pts, dtype=np.float32)
+            all_tracked_pts = np.array(all_tracked_pts, dtype=np.float32)
+            all_final_status = np.array(all_final_status, dtype=bool)
+            
+            # 转换为BGR图像用于可视化
+            curr_image_bgr = cv2.cvtColor(curr_gray, cv2.COLOR_GRAY2BGR) if len(curr_gray.shape) == 2 else curr_gray
+            
+            vis_img = visualize_optical_flow_tracking(
+                curr_image_bgr,
+                all_prev_pts, all_tracked_pts, all_final_status,
+                inliers_mask=None,
+                window_name="KLT Tracking (Before Epipolar Filtering)",
+                show_stats=True,
+                frame_id=self.cur_frame.get_id(),
+                kf_id=self.cur_frame.ref_kf_id
+            )
+            cv2.imshow("KLT Tracking", vis_img)
+            cv2.waitKey(1)  # 非阻塞显示
+            
+            # 保存追踪数据用于对极约束后的可视化
+            self.tracking_prev_pts = all_prev_pts
+            self.tracking_tracked_pts = all_tracked_pts
+            self.tracking_final_status = all_final_status
+            self.tracking_kp_ids = all_kp_ids  # 保存ID用于内点映射
+        
+        return nb_good_3d
     
-    def epipolar_filtering(self):
+    def epipolar_filtering(self, n_tracked_valid_3d):
         """
-        执行 2D-2D 对极几何滤波，剔除异常点
+        执行 2D-2D 对极几何剔除异常点
         """
-        print("[VisualFrontEnd] Starting Epipolar Filtering...")
+        print("[VisualFrontEnd Epipolar Filtering] Starting Epipolar Filtering...")
 
-        # 1. 获取上一关键帧 (Previous KeyFrame)
-        # 注意：pcurframe.kfid 在 createKeyframe 之前应该是指向上一帧的 KF ID，或者我们维护一个 last_kfid
-        # 在 OV2SLAM 中，当前帧只有在插入 KF 时才更新 kfid，所以这里假设 kfid 指向的是它的参考关键帧
-        prev_kf = self.map_manager.get_keyframe(self.prev_frame.kfid)
+        # 1. 获取参考关键帧 (Reference KeyFrame)
+        # 使用当前帧的 ref_kf_id，因为当前帧已经绑定了参考关键帧
+        ref_kf = self.map_manager.get_keyframe(self.cur_frame.ref_kf_id)
 
-        if prev_kf is None:
-            print("[VisualFrontEnd] Error: Previous KeyFrame not found!")
+        if ref_kf is None:
+            print(f"[VisualFrontEnd Epipolar Filtering] Error: Reference KeyFrame not found! ref_kf_id: {self.cur_frame.ref_kf_id}")
             return
 
-        nb_kps = self.prev_frame.nbkps
-        if nb_kps < 8:
-            print(f"[VisualFrontEnd] Error: Not enough kps to compute Essential Matrix! nb_kps: {nb_kps} < 8")
+        n_kps = len(ref_kf.get_visual_feature_ids())
+        if n_kps < 8:
+            print(f"[VisualFrontEnd Epipolar Filtering] Error: Not enough kps to compute Essential Matrix! n_kps: {n_kps} < 8")
             return
 
         # 2. 准备数据容器
-        vkps_ids = []
-        vkf_bvs = []  # 上一帧 Bearing Vectors
-        vcur_bvs = [] # 当前帧 Bearing Vectors
-
+        valid_kps_ids = []
+        valid_prev_kf_bvs = []  # 上一关键帧 Bearing Vectors
+        valid_cur_bvs = [] # 当前帧 Bearing Vectors
 
         # 3. 视差检查 (Parallax Check)
-        R_kf_cur = prev_kf.get_T_c_w().rotation().matrix() @ self.cur_frame.get_T_w_c().rotation().matrix()
+        # 旋转补偿
+        R_ref_kf = ref_kf.get_T_c_w()[:3, :3]
+        R_cur = self.cur_frame.get_T_w_c()[:3, :3]
+        R_kf_prev_cur = R_ref_kf @ R_cur
+        print(f'[VisualFrontEnd Epipolar Filtering] R_kf_prev_cur: {R_kf_prev_cur}')
         
         avg_parallax = 0.0
         nb_parallax = 0
 
         # 获取当前帧所有特征点
-        current_kps = self.cur_frame.get_keypoints()
+        current_kps_ids = self.cur_frame.get_visual_feature_ids()
         
-        for kp in current_kps:
-            # 查找上一帧是否观测到了同一点
-            kfkp = prev_kf.get_keypoint_by_id(kp.lmid)
+        for kp_id in current_kps_ids:
+            # 查找参考关键帧是否观测到了同一点
+            ref_kf_bvs = ref_kf.get_feature_bearing(kp_id)
+            ref_kf_unpx = ref_kf.get_feature_undistorted_position(kp_id)
             
-            if kfkp is None:
+            if ref_kf_bvs is None:
+                print(f"[VisualFrontEnd Epipolar Filtering] Error: Reference KeyFrame not found! kp_id: {kp_id}")
                 continue
 
             # 收集数据 (用于后续 E 矩阵计算)
@@ -266,91 +450,158 @@ class VisualFrontend:
             # 但 kp.bv 已经是归一化方向向量 [x, y, z]，直接用 x/z, y/z 即可
             
             # 存储相机归一化向量
-            vkf_bvs.append(kfkp.bv)
-            vcur_bvs.append(kp.bv)
-            vkps_ids.append(kp.lmid)
+            cur_kp_bv = self.cur_frame.get_feature_bearing(kp_id)
+            valid_prev_kf_bvs.append(ref_kf_bvs)
+            valid_cur_bvs.append(cur_kp_bv)
+            valid_kps_ids.append(kp_id)
 
             # 计算旋转补偿后的视差
-            # 将当前点旋转到上一帧坐标系，看与观测点的距离
-            rot_bv = R_kf_cur @ kp.bv
-            # 投影回上一帧的像素平面 (Project to Image)
-            rot_px = prev_kf.pcalib.project_cam_to_image(rot_bv)
+            # 将当前点旋转到参考关键帧坐标系，看与观测点的距离
+            rot_bv = R_kf_prev_cur @ cur_kp_bv
+            # 投影回参考关键帧的像素平面 (Project to Image)
+            rot_px = ref_kf.camera.project_cam_to_image(rot_bv)
             
-            dist = np.linalg.norm(rot_px - kfkp.unpx) # unpx 是去畸变像素坐标
+            dist = np.linalg.norm(rot_px - ref_kf_unpx) # unpx 是去畸变像素坐标
             avg_parallax += dist
             nb_parallax += 1
 
-        if len(vkps_ids) < 8:
-            print(f"[VisualFrontEnd] Not enough kps to compute Essential Matrix! vkps_ids: {len(vkps_ids)} < 8")
-            return
-
         # 计算平均视差
         avg_parallax /= nb_parallax
+        self.logger.log_flexible(self.cur_frame.timestamp, "epipolar_filtering_avg_parallax", avg_parallax)
 
-        # 如果视差太小，认为是对极几何退化 (Pure Rotation or Standstill)，跳过过滤
-        if avg_parallax < 2.0 * self.config['ransac_err']:
-            print(f"[VisualFrontEnd] Not enough parallax: {avg_parallax:.2f} px. Skipping.")
+        # 如果视差太小（2*3.0），认为是对极几何退化 (Pure Rotation or Standstill)，跳过过滤
+        if avg_parallax < 6.0:
+            print(f"[VisualFrontEnd Epipolar Filtering] Not enough parallax: {avg_parallax:.2f} px. Skipping.")
             return
 
         do_optimize = False
         # 单目情况下使用运动优化，在追踪情况差的时候使用
-        if (self.map_manager.nbkfs > 2 and self.cur_frame.nb3dkps < 30):
+        if (len(self.map_manager.active_keyframes) > 2 and n_tracked_valid_3d < 30):
+            print(f"[VisualFrontEnd Epipolar Filtering] Using motion optimization for pose recovery n_tracked_valid_3d: {n_tracked_valid_3d}")
             do_optimize = True
 
-        print(f"[VisualFrontEnd] 5-pt EssentialMatrix Ransac: {do_optimize}")
-        print(f"[VisualFrontEnd] only on 3d kps: {False}")
-        print(f"[VisualFrontEnd] nb pts: {nb_kps}")
-        print(f"[VisualFrontEnd] avg. parallax: {avg_parallax}")
-        print(f"[VisualFrontEnd] nransac_iter_: {self.config['ransac_iter']}")
-        print(f"[VisualFrontEnd] fransac_err_: {self.config['ransac_err']}")
-        print(f"[VisualFrontEnd] \n\n")
+        print(f"[VisualFrontEnd Epipolar Filtering] 5-pt EssentialMatrix Ransac: {do_optimize}")
+        print(f"[VisualFrontEnd Epipolar Filtering] nb pts: {len(valid_kps_ids)}")
+        print(f"[VisualFrontEnd Epipolar Filtering] avg. parallax: {avg_parallax}")
+        print(f"[VisualFrontEnd Epipolar Filtering] nransac_iter_: {100}")
+        print(f"[VisualFrontEnd Epipolar Filtering] fransac_err_: {3.0}")
+        print(f"[VisualFrontEnd Epipolar Filtering] \n\n")
 
         # 计算本质矩阵 (RANSAC)
-        success, R, t, outliers_idx = MultiViewGeometry.compute_5pt_essential_matrix(
-            vkf_bvs, vcur_bvs, 
-            self.config['ransac_iter'],
-            self.config['ransac_err'],
+        bvs_prev_np = np.array(valid_prev_kf_bvs, dtype=np.float32) # 列表转numpy数组
+        bvs_cur_np = np.array(valid_cur_bvs, dtype=np.float32)
+        success, R_ref_cur, t_ref_cur, outliers_idx = MultiViewGeometry.compute_5pt_essential_matrix(
+            bvs_prev_np, bvs_cur_np, 
+            100,
+            3.0,
             do_optimize,
-            self.config['do_random'],
-            self.cur_frame.pcalib.fx,
-            self.cur_frame.pcalib.fy,
+            self.cur_frame.camera.fx,
+            self.cur_frame.camera.fy,
         )
 
-        print(f"[VisualFrontEnd] Epipolar nb outliers: {outliers_idx}")
+        print(f'[VisualFrontEnd Epipolar Filtering] EssentialMatrix RANSAC Result: ')
+        print(f'success: {success}')
+        print(f'R: {R_ref_cur}')
+        print(f't: {t_ref_cur}')
+        print(f'outliers_idx: {len(outliers_idx)}')
 
         if not success:
-            print(f"[VisualFrontEnd] No pose could be computed from 5-pt EssentialMatrix!")
+            self.logger.log_flexible(self.cur_frame.timestamp, "epipolar_filtering_outliers_count", 0.0)
+            self.logger.log_flexible(self.cur_frame.timestamp, "epipolar_filtering_outliers_count_ratio", 0.0)
+            print(f"[VisualFrontEnd Epipolar Filtering] No pose could be computed from 5-pt EssentialMatrix!")
             return
 
-        if len(outliers_idx) > 0.5 * len(vkps_ids):
-            print(f'Too many outliers, skipping as might be degenerate case')
+        self.logger.log_flexible(self.cur_frame.timestamp, "epipolar_filtering_outliers_count", len(outliers_idx))
+        self.logger.log_flexible(self.cur_frame.timestamp, "epipolar_filtering_outliers_count_ratio", len(outliers_idx) / len(valid_kps_ids))
+
+        if len(outliers_idx) > 0.5 * len(valid_kps_ids):
+            print(f'[VisualFrontEnd Epipolar Filtering] Too many outliers, skipping as might be degenerate case')
             return
 
-        # 剔除 Outliers
-        for idx in outliers_idx:
-            lmid = vkps_ids[idx] # 这里由于输入是vkps_ids，所以索引直接是从outliers_idx中取
-            self.map_manager.remove_obs_from_cur_frame(lmid)
+        # 剔除 Outliers - 批量删除，避免循环中多次重建索引
+        if len(outliers_idx) > 0:
+            all_outlier_ids = np.array(valid_kps_ids)[outliers_idx]
+            ids_to_remove = []
+            ids_to_remove_3d = []
+            
+            # TODO：这里可能要删除已三角化的外点，先记录
+            for kp_id in all_outlier_ids:
+                map_point = self.map_manager.get_map_point(kp_id)
+                if map_point is not None and map_point.status == MapPointStatus.TRIANGULATED:
+                    # ids_to_remove.append(kp_id)
+                    ids_to_remove_3d.append(kp_id)
+                    continue
+                else:
+                    ids_to_remove.append(kp_id)
+            
+            if len(ids_to_remove) > 0:
+                self.cur_frame.remove_features_by_ids(ids_to_remove)
 
-        # 单目模式下的位姿恢复
+        print(f'[VisualFrontEnd Epipolar Filtering] Epipolar outliers: {ids_to_remove_3d}')
+        print(f'[VisualFrontEnd Epipolar Filtering] Epipolar nb outliers: {len(ids_to_remove_3d)}')
+        
+        # 可视化对极约束后的结果（包含内点信息）
+        if self.visualize_optical_flow and self.tracking_prev_pts is not None and self.tracking_kp_ids is not None:
+            # 构建内点掩码：根据特征点ID匹配
+            if len(outliers_idx) > 0:
+                outlier_ids = set(np.array(valid_kps_ids)[outliers_idx])
+                # 创建内点掩码：对于追踪数据中的每个点，如果在对极约束中不是外点，则为内点
+                inliers_mask = np.ones(len(self.tracking_final_status), dtype=bool)
+                for i, kp_id in enumerate(self.tracking_kp_ids):
+                    # 如果追踪失败，肯定不是内点
+                    if not self.tracking_final_status[i]:
+                        inliers_mask[i] = False
+                    # 如果在对极约束的外点列表中，也不是内点
+                    elif kp_id in outlier_ids:
+                        inliers_mask[i] = False
+            else:
+                # 没有外点，所有追踪成功的都是内点
+                inliers_mask = self.tracking_final_status.copy()
+            
+            # 获取图像用于可视化
+            if self.cur_frame.image is not None:
+                curr_image_bgr = self.cur_frame.image.copy()
+            else:
+                # 如果没有当前帧图像，使用灰度图
+                curr_gray = self.preprocess_image(self.cur_frame.image) if self.cur_frame.image is not None else None
+                if curr_gray is not None:
+                    curr_image_bgr = cv2.cvtColor(curr_gray, cv2.COLOR_GRAY2BGR)
+                else:
+                    return  # 无法可视化
+            
+            vis_img = visualize_optical_flow_tracking(
+                curr_image_bgr,
+                self.tracking_prev_pts, self.tracking_tracked_pts, self.tracking_final_status,
+                inliers_mask=inliers_mask,
+                window_name="KLT Tracking (After Epipolar Filtering)",
+                show_stats=True,
+                frame_id=self.cur_frame.get_id(),
+                kf_id=self.cur_frame.ref_kf_id
+            )
+            cv2.imshow("KLT Tracking (With Inliers)", vis_img)
+            cv2.waitKey(1)  # 非阻塞显示
+
+        # TODO：单目模式下的位姿恢复（这里可以直接考虑替换VGGT）
         # 如果是单目且跟踪点少，尝试用 E 分解出的 R, t 替换当前位姿
-        if(do_optimize and self.map_manager.nbkfs > 2):
-            T_prev_w = prev_kf.get_T_c_w()
+        if(do_optimize and len(self.map_manager.active_keyframes) > 2):
+            T_ref_w = ref_kf.get_T_c_w()
             T_w_cur = self.cur_frame.get_T_w_c()
-            T_prev_cur = T_prev_w.compose(T_w_cur)
+            T_ref_cur = T_ref_w @ T_w_cur
 
             # 从运动模型获取当前位姿预测的平移尺度
-            scale = np.linalg.norm(T_prev_cur.translation())
+            scale = np.linalg.norm(T_ref_cur[:3, 3])
 
             # 归一化从本质矩阵中计算出的t并应用尺度
             # 相当于认为本质矩阵计算出的t的尺度和运动模型预测的尺度一致，只提供方向信息
-            t_scaled = (t / np.linalg.norm(t)) * scale
+            t_scaled = (t_ref_cur / np.linalg.norm(t_ref_cur)) * scale
 
-            # 构建新的相对位姿 T_prev_cur_new (GTSAM Pose3)
-            # 注意 OpenCV R 转 GTSAM Rot3
-            T_prev_cur_new = gtsam.Pose3(gtsam.Rot3(R), gtsam.Point3(t_scaled.flatten()))
+            # 构建新的相对位姿 T_ref_cur_new (GTSAM Pose3)
+            T_ref_cur_new = np.eye(4, dtype=np.float64)
+            T_ref_cur_new[:3, :3] = R_ref_cur  # 填入本质矩阵分解的 R
+            T_ref_cur_new[:3, 3] = t_scaled.flatten() # 填入修正尺度后的t
 
-            T_w_kf = prev_kf.get_T_w_c()
-            T_w_c_new = T_w_kf.compose(T_prev_cur_new)
+            T_w_ref_kf = ref_kf.get_T_w_c()
+            T_w_c_new = T_w_ref_kf @ T_ref_cur_new
 
             self.cur_frame.set_T_w_c(T_w_c_new)
     
@@ -360,11 +611,11 @@ class VisualFrontend:
         """
         # 计算视差 (不进行旋转补偿，因为此时没有可靠的旋转估计，或者假设为 Identity)
         avg_rot_parallax = self.compute_parallax(
-            self.cur_frame.kfid,
+            self.cur_frame.ref_kf_id,
             do_unrot = False
         )
 
-        print(f"[VisualFrontEnd] Init current parallax: {avg_rot_parallax:.2f} px")
+        print(f"[VisualFrontEnd Init Check] Init current parallax: {avg_rot_parallax:.2f} px")
 
         if avg_rot_parallax <= self.config['init_parallax']:
             print(f" -> Not enough parallax (< {self.config['init_parallax']})")
@@ -372,93 +623,104 @@ class VisualFrontend:
 
         t_start = time.time()
 
-        prev_kf = self.map_manager.get_keyframe(self.cur_frame.kfid)
-        if prev_kf is None:
-            print(f"[VisualFrontEnd] Error: Previous KeyFrame not found!")
+        ref_kf = self.map_manager.get_keyframe(self.cur_frame.ref_kf_id)
+        if ref_kf is None:
+            print(f"[VisualFrontEnd Init Check] Error: Reference KeyFrame not found!")
             return False
 
-        nb_kps = self.cur_frame.nbkps
+        nb_kps = len(self.cur_frame.get_visual_feature_ids())
         if nb_kps < 8:
-            print(f"[VisualFrontEnd] Error: Not enough kps to compute Essential Matrix! nb_kps: {nb_kps} < 8")
+            print(f"[VisualFrontEnd Init Check] Error: Not enough kps to compute Essential Matrix! nb_kps: {nb_kps} < 8")
             return False
 
         # 准备数据计算本质矩阵 E
-        vkps_ids = []
-        vkf_bvs = []  # 上一帧 Bearing Vectors
-        vcur_bvs = [] # 当前帧 Bearing Vectors
+        valid_kps_ids = []
+        valid_prev_kf_bvs = []  # 参考关键帧 Bearing Vectors
+        valid_cur_bvs = [] # 当前帧 Bearing Vectors
 
         # 重新计算旋转补偿视差 (为了验证和筛选点)
-        R_kf_cur = prev_kf.get_T_c_w().rotation().matrix() @ self.cur_frame.get_T_w_c().rotation().matrix()
+        R_ref_kf = ref_kf.get_T_c_w()[:3, :3]
+        R_cur = self.cur_frame.get_T_w_c()[:3, :3]
+        R_kf_ref_cur = R_ref_kf @ R_cur
 
         # 遍历当前帧所有特征点
-        current_kps = self.cur_frame.get_keypoints()
-        valid_pairs = []
+        current_kps_ids = self.cur_frame.get_visual_feature_ids()
+        valid_dist = []
 
-        for kp in current_kps:
-            kfkp = prev_kf.get_keypoint_by_id(kp.lmid)
-            if kfkp is None:
+        for kp_id in current_kps_ids:
+            cur_kp_bv = self.cur_frame.get_feature_bearing(kp_id)
+            ref_kf_bvs = ref_kf.get_feature_bearing(kp_id)
+            ref_kf_unpx = ref_kf.get_feature_undistorted_position(kp_id)
+            if ref_kf_bvs is None:
                 continue
 
             # 计算旋转补偿后的视差
-            rot_bv = R_kf_cur @ kp.bv
-            unpx_cur = prev_kf.pcalib.project_cam_to_image(rot_bv) # TODO：此处有些奇怪，需要进一步查看
+            rot_bv = R_kf_ref_cur @ cur_kp_bv
+            rot_px = ref_kf.camera.project_cam_to_image(rot_bv)
 
             # 视差距离
-            dist = np.linalg.norm(unpx_cur - kfkp.unpx)
+            dist = np.linalg.norm(rot_px - ref_kf_unpx)
 
-            vkf_bvs.append(kfkp.bv)
-            vcur_bvs.append(kp.bv)
-            vkps_ids.append(kp.lmid)
-            valid_pairs.append(dist)
+            valid_prev_kf_bvs.append(ref_kf_bvs)
+            valid_cur_bvs.append(cur_kp_bv)
+            valid_kps_ids.append(kp_id)
+            valid_dist.append(dist)
 
-        if len(vkf_bvs) < 8:
-            print(f"[VisualFrontEnd] Error: Not enough prev KF kps to compute 5-pt Essential Matrix! vkf_bvs: {len(vkf_bvs)} < 8")
+        if len(valid_prev_kf_bvs) < 8:
+            print(f"[VisualFrontEnd Init Check] Error: Not enough ref KF kps to compute 5-pt Essential Matrix! valid_prev_kf_bvs: {len(valid_prev_kf_bvs)} < 8")
             return False
 
-        if valid_pairs:
-            avg_rot_parallax = np.mean(valid_pairs)
+        if valid_dist:
+            avg_rot_parallax = np.mean(valid_dist)
         else:
             avg_rot_parallax = 0.0
         
         if avg_rot_parallax < self.config['init_parallax']:
-            print(f" -> Not enough ROT-COMPENSATED parallax ({avg_rot_parallax:.2f} px)")
+            print(f"[VisualFrontEnd Init Check] -> Not enough ROT-COMPENSATED parallax ({avg_rot_parallax:.2f} px)")
             return False
 
         # 计算 5点法本质矩阵
-        print(f"[VisualFrontEnd] Computing 5-pt Essential Matrix (RANSAC iter={self.config['ransac_iter']})...")
-        success, R_kf_cur, t_kf_cur, outliers_idx = MultiViewGeometry.compute_5pt_essential_matrix(
-            np.array(vkf_bvs), 
-            np.array(vcur_bvs), 
-            self.config['ransac_iter'],
-            self.config['ransac_err'],
-            do_ptimize=True,
-            fx=self.cur_frame.pcalib.fx,
-            fy=self.cur_frame.pcalib.fy,
+        print(f"[VisualFrontEnd Init Check] Computing 5-pt Essential Matrix ...")
+        bvs_prev_np = np.array(valid_prev_kf_bvs, dtype=np.float32) # 列表转numpy数组
+        bvs_cur_np = np.array(valid_cur_bvs, dtype=np.float32)
+        success, R_ref_cur, t_ref_cur, outliers_idx = MultiViewGeometry.compute_5pt_essential_matrix(
+            bvs_prev_np, bvs_cur_np, 
+            100,
+            3.0,
+            do_optimize=True,
+            fx=self.cur_frame.camera.fx,
+            fy=self.cur_frame.camera.fy,
         )
 
-        print(f"[VisualFrontEnd] Epipolar nb outliers: {outliers_idx}")
+        print(f"[VisualFrontEnd Init Check] Epipolar nb outliers: {outliers_idx}")
+        print(f"[VisualFrontEnd Init Check] Epipolar nb inliers: {len(valid_kps_ids) - len(outliers_idx)}")
 
         if not success:
-            print(f"[VisualFrontEnd] No pose could be computed from 5-pt EssentialMatrix!")
+            print(f"[VisualFrontEnd Init Check] No pose could be computed from 5-pt EssentialMatrix!")
             return False
 
         # 剔除 Outliers
-        for idx in outliers_idx:
-            lmid = vkps_ids[idx] # 这里由于输入是vkps_ids，所以索引直接是从outliers_idx中取
-            self.map_manager.remove_obs_from_cur_frame(lmid)
+        if len(outliers_idx) > 0:
+            ids_to_remove = np.array(valid_kps_ids)[outliers_idx]
+            self.cur_frame.remove_features_by_ids(ids_to_remove)
 
         # 设置初始位姿 (人为设定尺度)
         # normalize t and apply scale
-        t_kf_cur = t_kf_cur / np.linalg.norm(t_kf_cur)
-        t_kf_cur = t_kf_cur * 0.25 # Arbitrary scale for initialization (e.g. baseline)
+        t_ref_cur_scaled = t_ref_cur / np.linalg.norm(t_ref_cur)
+        t_ref_cur_scaled = t_ref_cur_scaled * 0.25 # Arbitrary scale for initialization (e.g. baseline)
 
-        print(f"[VisualFrontEnd] Init translation: {t_kf_cur}")
+        print(f"[VisualFrontEnd Init Check] Init translation: {t_ref_cur_scaled}")
 
-        pose_init = gtsam.Pose3(gtsam.Rot3(R_kf_cur), gtsam.Point3(t_kf_cur))
-        self.cur_frame.set_T_w_c(pose_init)        
+        # 第一帧参考帧位姿应为单位阵
+        pose_init = np.eye(4)
+        pose_init[:3, :3] = R_ref_cur
+        pose_init[:3, 3] = t_ref_cur_scaled
+        self.cur_frame.set_T_w_c(pose_init)      
+
+        print(f"[VisualFrontEnd Init Check] Initial second frame pose: {self.cur_frame.get_T_w_c()}")
 
         t_end = time.time()
-        print(f"[VisualFrontEnd] Initialization took {(t_end - t_start)*1000:.1f} ms")
+        print(f"[VisualFrontEnd Init Check] Initialization took {(t_end - t_start)*1000:.1f} ms")
 
         return True
 
@@ -467,37 +729,43 @@ class VisualFrontend:
         计算当前帧和上一帧的平均视差
         """
         prev_kf = self.map_manager.get_keyframe(kfid)
+        print(f'prev_kf: {prev_kf.id}')
         if prev_kf is None:
             print(f"[VisualFrontEnd] Error: Previous KeyFrame not found!")
             return 0.0
 
         # 计算相对旋转用于旋转补偿
         if do_unrot:
-            R_kf_cur = prev_kf.get_T_c_w().rotation().matrix() @ self.cur_frame.get_T_w_c().rotation().matrix()
+            R_kf_cur = prev_kf.get_T_c_w()[:3, :3] @ self.cur_frame.get_T_w_c()[:3, :3]
         else:
             R_kf_cur = np.eye(3)
 
         parallax_list = []
-        current_kps = self.cur_frame.get_keypoints()
+        current_kps_ids = self.cur_frame.get_visual_feature_ids()
 
-        for kp in current_kps:
-            # 过滤3d点
-            if do_2d_only and kp.is3d:
+        # 计算在上一个关键帧内可见的所有kps（pcurframe_->mapkps_？）
+        for kp_id in current_kps_ids:
+            # 过滤3d点（防止优化3d点影响视差判断，保持视差的纯粹性）
+            mp = self.map_manager.get_map_point(kp_id)
+            if do_2d_only and (mp.status == MapPointStatus.TRIANGULATED):
                 continue
 
-            kfkp = prev_kf.get_keypoint_by_id(kp.lmid)
-            if kfkp is None:
-                continue
+            prev_kf_kp = prev_kf.get_feature_position(kp_id)
+            prev_kf_unpx = prev_kf.get_feature_undistorted_position(kp_id)
+  
+            cur_kf_unpx = self.cur_frame.get_feature_undistorted_position(kp_id)
+            cur_kp_bv = self.cur_frame.get_feature_bearing(kp_id)
+            unpx_prev = cur_kf_unpx
 
-            # 去畸变像素坐标
-            unpx_cur = kp.unpx
+            if prev_kf_kp is None:
+                continue
 
             if do_unrot:
-                rot_bv = R_kf_cur @ kp.bv
-                unpx_cur = prev_kf.pcalib.project_cam_to_image(rot_bv) # 还是投影到上一帧的像素平面
+                rot_bv = R_kf_cur @ cur_kp_bv
+                unpx_prev = prev_kf.camera.project_cam_to_image(rot_bv) # 还是投影到上一帧的像素平面
 
             # 计算欧式距离
-            dist = np.linalg.norm(unpx_cur - kfkp.unpx)
+            dist = np.linalg.norm(unpx_prev - prev_kf_unpx)
             parallax_list.append(dist)
 
         if not parallax_list:
@@ -508,88 +776,81 @@ class VisualFrontend:
         else:
             return float(np.mean(parallax_list))
 
-    def compute_pose(self):
-        """
-        计算当前帧位姿 (P3P + PnP Optimization)
-        对应 VisualFrontEnd::computePose
-        """
-        nb3dkps = self.pcurframe.nb3dkps
-        if nb3dkps < 4:
-            if self.params.debug:
-                print("[ComputePose] Not enough 3D kps for PnP")
+    def compute_pose(self, n_tracked_valid_3d):
+        if n_tracked_valid_3d < 4:
+            print(f"[VisualFrontEnd] Not enough 3D kps for PnP")
             return
 
         # 1. 准备数据
         # 收集所有 3D 点及其对应的 2D 观测
-        vbvs = []   # Bearing Vectors (用于 P3P)
-        vwpts = []  # World Points
-        vkps = []   # 2D Normalized Points (用于 GTSAM PnP)
-        vkpids = [] # 地图点 ID (用于追踪 Outlier)
+        valid_bvs = []   # Bearing Vectors (用于 P3P)
+        valid_wpts = []  # World Points
+        valid_kps = []   # 2D Normalized Points (用于 GTSAM PnP)
+        valid_kps_ids = [] # 地图点 ID (用于追踪 Outlier)
         
-        current_kps = self.pcurframe.get_keypoints()
-        for kp in current_kps:
-            if not kp.is3d:
+        current_kps_ids = self.cur_frame.get_visual_feature_ids()
+        for kp_id in current_kps_ids:
+            # 只使用三角化的点计算PnP
+            map_point = self.map_manager.get_map_point(kp_id)
+            if map_point is None or map_point.status != MapPointStatus.TRIANGULATED:
+                # print(f"[VisualFrontEnd Compute Pose] Error: Map point {kp_id} is not valid!")
                 continue
             
-            mp = self.map_manager.get_map_point(kp.lmid)
-            if mp is None:
+            current_kps_bvs = self.cur_frame.get_feature_bearing(kp_id)
+            current_kps_unpx = self.cur_frame.get_feature_undistorted_position(kp_id)
+
+            if current_kps_bvs is None or current_kps_unpx is None:
+                print(f"[VisualFrontEnd Compute Pose] Error: Current kp {kp_id} is not valid!")
                 continue
-            
-            vbvs.append(kp.bv) # [x, y, z]
+
+            valid_bvs.append(current_kps_bvs) # [x, y, z]
             # GTSAM PnP 需要归一化平面坐标
-            vkps.append(kp.unpx) # unpx 是去畸变的像素坐标，需要归一化?
-            # 这里的 unpx 如果是像素单位，GTSAM PnP 里 K 设为单位阵就不对了
-            # 修正：根据 C++ 代码 ceresPnP 传入的是 unkps (Vector2d)，
-            # 并且 LossFunction 里使用了 fx, fy, cx, cy。
-            # 这意味着 GTSAM 里我们应该用真实的 K (fx, fy, cx, cy) 和 unpx (像素坐标)。
-            # 或者我们把点转为归一化坐标，K 设为单位阵。
-            # 为了与 MultiViewGeometry.gtsam_pnp 保持一致 (Input: Normalized)，我们转换一下：
+            # 归一化坐标: x_n = (u - cx)/fx，归一化坐标的话后续PnP解算使用K为单位阵
+            norm_x = (current_kps_unpx[0] - self.cur_frame.camera.cx) / self.cur_frame.camera.fx
+            norm_y = (current_kps_unpx[1] - self.cur_frame.camera.cy) / self.cur_frame.camera.fy
+            valid_kps.append(np.array([norm_x, norm_y]))
             
-            # 归一化坐标: x_n = (u - cx)/fx
-            norm_x = (kp.unpx[0] - self.pcurframe.pcalib.cx) / self.pcurframe.pcalib.fx
-            norm_y = (kp.unpx[1] - self.pcurframe.pcalib.cy) / self.pcurframe.pcalib.fy
-            vkps.append(np.array([norm_x, norm_y]))
-            
-            vwpts.append(mp.get_point())
-            vkpids.append(kp.lmid)
+            valid_wpts.append(map_point.get_point())
+            valid_kps_ids.append(kp_id)
 
-        np_bvs = np.array(vbvs)
-        np_wpts = np.array(vwpts)
-        np_kps = np.array(vkps)
+        np_bvs = np.array(valid_bvs)
+        np_wpts = np.array(valid_wpts)
+        np_kps = np.array(valid_kps)
 
-        T_wc = self.pcurframe.get_T_w_c() # 当前预测位姿
+        T_wc = self.cur_frame.get_T_w_c() # 当前预测位姿
+        print(f"[VisualFrontEnd Compute Pose] Current predicted pose: {T_wc}")
         
-        # 2. P3P RANSAC (如果需要)
-        # 如果跟踪失败标志位 bp3preq_ 为真，或者系统配置要求强制 P3P
-        do_p3p = self.bp3preq or self.params.dop3p
-        
-        if do_p3p:
-            if self.params.debug:
-                print(f"[ComputePose] Running P3P RANSAC on {len(np_bvs)} points...")
+        # 2. P3P RANSAC (如果需要，追踪3d点较少，追踪质量较差时使用)
+        # TODO: 暂时设为True，应该为self.do_p3p
+        if True:
+            print(f"[VisualFrontEnd Compute Pose] Running P3P RANSAC on {len(np_bvs)} points...")
 
-            success, p3p_pose, outliers_idx = MultiViewGeometry.opencv_p3p_ransac(
+            success, p3p_pose, outliers_idx = MultiViewGeometry.p3p_ransac(
                 np_bvs, np_wpts, 
-                nmaxiter=self.params.nransac_iter,
-                errth=self.params.fransac_err,
-                fx=self.pcurframe.pcalib.fx,
-                fy=self.pcurframe.pcalib.fy,
-                boptimize=True
+                nmaxiter=100,
+                errth=3.0,
+                fx=self.cur_frame.camera.fx,
+                fy=self.cur_frame.camera.fy,
+                boptimize=False
             )
             
             # 检查 P3P 结果是否可用
             n_inliers = len(np_bvs) - len(outliers_idx)
-            
+            print(f"[VisualFrontEnd Compute Pose] P3P RANSAC success: {success}")
+            print(f"[VisualFrontEnd Compute Pose] P3P RANSAC inliers: {n_inliers}")
+
             if not success or n_inliers < 5:
-                print("[ComputePose] P3P Failed or not enough inliers. Resetting.")
+                print("[VisualFrontEnd Compute Pose] P3P Failed or not enough inliers. Resetting.")
+                # 此时cur_frame.T_w_c，还是使用的运动模型预测位姿
+                # TODO：reset？
                 # self.reset_frame() 
                 return
 
             # 更新位姿
             T_wc = p3p_pose
-            self.pcurframe.set_T_w_c(T_wc)
+            self.cur_frame.set_T_w_c(T_wc)
             
             # 移除外点 (剔除数据，为接下来的 PnP 做准备)
-            # 注意：倒序删除或构建新列表以避免索引错乱
             # 这里的逻辑是直接从 map_manager 移除观测，并从本地列表移除
             # 简单起见，我们重新构建 inlier 列表用于下一步 GTSAM 优化
             inlier_mask = np.ones(len(np_bvs), dtype=bool)
@@ -598,55 +859,134 @@ class VisualFrontend:
             np_kps = np_kps[inlier_mask]
             np_wpts = np_wpts[inlier_mask]
             # vkpids 也需要更新，用于最后移除
-            vkpids = [vkpids[i] for i in range(len(vkpids)) if inlier_mask[i]]
-            
-            # 真实移除 Map 观测
-            for idx in outliers_idx:
-                # 原始 vkpids 里的 ID
-                # 这里逻辑有点绕，上面已经过滤了。
-                # 应该在过滤前记录原始需要删除的 ID
-                # 暂且略过，实际逻辑是在最后统一移除
-                pass
+            valid_kps_ids = [valid_kps_ids[i] for i in range(len(valid_kps_ids)) if inlier_mask[i]]
 
         # 3. GTSAM PnP Optimization (Motion-only BA)
-        # 替代 ceresPnP
         success, optimized_pose, outliers_idx = MultiViewGeometry.gtsam_pnp(
             np_kps, np_wpts, T_wc,
-            nmaxiter=5, # C++ 中设为 5
-            chi2th=self.params.robust_mono_th, # Chi2 阈值 (e.g., 5.99)
-            buse_robust=True,
-            fx=self.pcurframe.pcalib.fx,
-            fy=self.pcurframe.pcalib.fy
+            nmaxiter=5,
+            chi2th=5.9915, # Chi2 阈值 (e.g., 5.99)
+            use_robust=True,
+            fx=self.cur_frame.camera.fx,
+            fy=self.cur_frame.camera.fy
         )
         
         n_inliers = len(np_kps) - len(outliers_idx)
         
-        if self.params.debug:
-            print(f"[ComputePose] GTSAM PnP Outliers: {len(outliers_idx)} / {len(np_kps)}")
+        print(f"[VisualFrontEnd Compute Pose] GTSAM PnP Outliers: {len(outliers_idx)} / {len(np_kps)}")
 
         # 检查优化结果有效性
         if not success or n_inliers < 5 or len(outliers_idx) > 0.5 * len(np_kps):
-            if not do_p3p:
-                # 如果刚才没做 P3P，那说明可能是局部极小值或跟踪丢了，请求下一帧做 P3P
-                self.bp3preq = True
-                print("[ComputePose] GTSAM PnP failed, requesting P3P for next frame.")
-            elif self.params.mono:
-                # 如果单目模式下 P3P 后优化依然挂了，重置
-                print("[ComputePose] Optimization failed after P3P. Resetting.")
-                # self.reset_frame()
+            # 如果单目模式下 P3P 后优化依然挂了，重置
+            print("[VisualFrontEnd Compute Pose] Optimization failed after P3P. Resetting.")
+            # self.reset_frame()
             return
 
         # 4. 更新最终位姿
-        self.pcurframe.set_T_w_c(optimized_pose)
-        self.bp3preq = False # 成功，清除标记
+        self.cur_frame.set_T_w_c(optimized_pose)
+        self.do_p3p = False # 成功，清除标记
 
-        # 5. 移除外点
-        for idx in outliers_idx:
-            lmid = vkpids[idx]
-            self.map_manager.remove_obs_from_cur_frame(lmid)
+        # 5. 移除外点：收集所有外点ID后统一删除
+        if len(outliers_idx) > 0:
+            outlier_ids = [valid_kps_ids[idx] for idx in outliers_idx]
+            self.cur_frame.remove_features_by_ids(outlier_ids)
 
-    def check_new_keyframe(self):
-        """
-        检查是否为新关键帧
-        """
-        return self.cur_frame.is_new_keyframe()
+    def check_new_keyframe(self, n_tracked_valid_3d):
+        # 获取参考关键帧 (Reference KF)
+        ref_kf = self.map_manager.get_keyframe(self.cur_frame.ref_kf_id)
+        if ref_kf is None:
+            # 这种情况理论上不应发生，除非是第一帧
+            return False
+
+        # 计算平均/中值视差 (旋转补偿后)
+        # do_unrot=True, median=True, do_2d_only=False
+        med_rot_parallax = self.compute_parallax(
+            self.cur_frame.ref_kf_id, do_unrot=True, median=True, do_2d_only=False
+        )
+
+        # 帧 ID 差 (当前帧与参考关键帧之间隔了多少普通帧)
+        # 你的 Frame id 应该是全局递增的
+        n_frames_since_kf = self.cur_frame.get_id() - ref_kf.get_id()
+        
+        # 统计数据
+        # nb3dkps: 当前帧跟踪到的 3D 点数量
+        # nbmaxkps: 最大特征点数配置
+        nb_3d_kps = n_tracked_valid_3d
+        visual_features_num = len(self.cur_frame.get_visual_feature_ids()) 
+        n_max_kps = self.config['max_features_to_detect']
+        
+        # TODO: 暂时设为 False，后续对接后端时替换
+        is_local_ba_running = False
+
+        # [计算] 遍历参考帧的所有特征ID，检查它们是否对应有效的 3D 地图点
+        n_ref_3d = 0
+        ref_ids = ref_kf.get_visual_feature_ids()
+        # 统计有多少个 id 在 map_manager 里能找到对应的 MapPoint
+        for fid in ref_ids:
+            mp = self.map_manager.get_map_point(fid)
+            if mp is not None and mp.status == MapPointStatus.TRIANGULATED:
+                n_ref_3d += 1
+        
+        # 防止除零或第一帧情况
+        if n_ref_3d == 0: n_ref_3d = nb_3d_kps # 默认使用当前帧的 3D 点数
+
+        # ---------------------------------------------------------------------
+        # 条件 1: 跟踪极差 (特征点覆盖率极低)
+        # ---------------------------------------------------------------------
+        # 覆盖率 < 33% 且距离上一 KF 超过 5 帧 且 后端空闲
+        if (visual_features_num < 0.33 * n_max_kps and 
+            n_frames_since_kf >= 5 and 
+            not is_local_ba_running):
+            print(f"[VisualFrontEnd Check New Keyframe] Low occupancy ({visual_features_num}), inserting KF.")
+            return True
+
+        # ---------------------------------------------------------------------
+        # 条件 2: 3D 点极少 (快跟丢了)
+        # ---------------------------------------------------------------------
+        # 3D 点 < 20 且 距离上一 KF 超过 2 帧
+        if (nb_3d_kps < 20 and 
+            n_frames_since_kf >= 2):
+            print(f"[CheckKf] Low 3D kps ({nb_3d_kps}), inserting KF.")
+            return True
+
+        # ---------------------------------------------------------------------
+        # 抑制条件: 如果 3D 点充足，且 (后端忙 OR 间隔太短)，则不插
+        # ---------------------------------------------------------------------
+        if (nb_3d_kps > 0.5 * n_max_kps and 
+            (is_local_ba_running or n_frames_since_kf < 2)):
+            return False
+
+        # ---------------------------------------------------------------------
+        # 条件 3: 视差或立体视觉间隔
+        # ---------------------------------------------------------------------
+        # 基础条件 cx: 视差达到阈值的一半 (或者立体模式下的帧间隔)
+        min_parallax_threshold = self.config['init_parallax']
+        cx = med_rot_parallax >= min_parallax_threshold / 2.0
+
+        # ---------------------------------------------------------------------
+        # 核心触发条件 (c0, c1, c2)
+        # ---------------------------------------------------------------------
+        # c0: 视差足够大 (主要条件)
+        c0 = med_rot_parallax >= min_parallax_threshold
+        
+        # c1: 3D 点数显著减少 (相对于参考 KF 减少了 25% 以上)
+        # 这通常意味着相机移动到了新区域，老点看不到了
+        c1 = nb_3d_kps < 0.75 * n_ref_3d
+        
+        # c2: 覆盖率和 3D 点数都下降，且后端空闲
+        c2 = (visual_features_num < 0.5 * n_max_kps and 
+              nb_3d_kps < 0.85 * n_ref_3d and 
+              not is_local_ba_running)
+
+        # 最终判断: 满足任意核心条件 (c0/c1/c2) 且 满足基础视差条件 (cx)
+        is_kf_required = (c0 or c1 or c2) and cx
+
+        if is_kf_required:
+            print(f"-------------------------------------------------------------------")
+            print(f">>> Check Keyframe conditions met:")
+            print(f"> Cur Frame ID: {self.cur_frame.get_id()} / Ref KF ID: {ref_kf.get_id()}")
+            print(f"> Ref KF 3D kps: {n_ref_3d} / Cur 3D kps: {nb_3d_kps}")
+            print(f"> Occupancy: {visual_features_num} / Median Parallax: {med_rot_parallax:.2f}")
+            print(f"-------------------------------------------------------------------")
+
+        return is_kf_required

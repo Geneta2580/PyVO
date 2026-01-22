@@ -71,70 +71,17 @@ class CameraCalibration:
         self.undist_map_x = None
         self.undist_map_y = None
 
-        # 互斥锁
-        self.intrinsic_mutex = threading.Lock()
+        print(f'\n Camera Calibration initialized\n')
+        print(f'Camera intrinsics: {self.K}')
+        print(f'Camera distortion coefficients: {self.D}\n')
 
-        # 设置去畸变映射表
-        self.set_undist_map()
+    def is_in_image(self, pt_2d):
+        if pt_2d is None:
+            return False
+        x, y = pt_2d
+        return x >= 0 and x < self.img_w and y >= 0 and y < self.img_h
 
-    def set_undist_map(self):
-        """
-        计算去畸变映射表 (单目)
-        """
-        print("\n[CameraCalibration] Computing the undistortion mapping!")
-        
-        with self.intrinsic_mutex:
-            new_K = None
-            img_size_cv = self.img_size
-
-            if self.model == CameraModel.PINHOLE:
-                # cv2.getOptimalNewCameraMatrix 返回 newCameraMatrix, validPixROI
-                new_K, valid_roi = cv2.getOptimalNewCameraMatrix(
-                    self.K, self.D, img_size_cv, self.alpha, img_size_cv
-                )
-                # valid_roi 是 (x, y, w, h)
-                self.roi_rect = valid_roi 
-                
-                self.undist_map_x, self.undist_map_y = cv2.initUndistortRectifyMap(
-                    self.K, self.D, None, new_K, img_size_cv, cv2.CV_32FC1
-                )
-
-            elif self.model == CameraModel.FISHEYE:
-                # OpenCV python binding for fisheye estimateNewCameraMatrix is slightly different usually
-                new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                    self.K, self.D, img_size_cv, np.eye(3),balance=self.alpha
-                )
-                
-                self.undist_map_x, self.undist_map_y = cv2.fisheye.initUndistortRectifyMap(
-                    self.K, self.D, np.eye(3), new_K, img_size_cv, cv2.CV_32FC1
-                )
-
-            # 更新类成员变量为去畸变后的参数
-            self.K = new_K
-            self.D = np.zeros(4, dtype=np.float64) # 去畸变后畸变系数为0
-            self.k1 = self.k2 = self.p1 = self.p2 = 0.0
-
-            self.fx = self.K[0, 0]
-            self.fy = self.K[1, 1]
-            self.cx = self.K[0, 2]
-            self.cy = self.K[1, 2]
-
-            self.iK = np.linalg.inv(self.K)
-            self.ifx = self.iK[0, 0]
-            self.ify = self.iK[1, 1]
-            self.icx = self.iK[0, 2]
-            self.icy = self.iK[1, 2]
-
-            # 更新 ROI mask
-            self._update_roi_mask(self.roi_rect)
-
-            print("\n[CameraCalibration] Undist Camera Calibration set as : \n")
-            print(f" K = \n{self.K}")
-            print(f" D = {self.D.flatten()}")
-            print(f" ROI = {self.roi_rect}")
-
-
-    def _update_roi_mask(self, roi: tuple):
+    def _update_roi_mask(self, roi):
         nborder = 5
         x, y, w, h = roi
         
@@ -151,96 +98,140 @@ class CameraCalibration:
         if w > 0 and h > 0:
             self.roi_mask[y:y+h, x:x+w] = 255
 
-    def rectify_image(self, img: np.ndarray) -> np.ndarray:
-        """
-        对图像进行去畸变
-        """
-        with self.intrinsic_mutex:
-            if self.undist_map_x is not None and self.undist_map_y is not None:
-                return cv2.remap(img, self.undist_map_x, self.undist_map_y, cv2.INTER_LINEAR)
-            else:
-                return img.copy()
+    def project_world_to_image(self, T_wc, pt_3d_w):
+        T_cw = np.linalg.inv(T_wc)
 
-    def project_cam_to_image(self, pt_3d: np.ndarray) -> np.ndarray:
+        pt_3d_w_hom = np.append(pt_3d_w, 1.0)
+        pt_3d_c_hom = T_cw @ pt_3d_w_hom
+        pt_3d_c = pt_3d_c_hom[:3]
+
+        # 检查深度
+        if pt_3d_c[2] <= 0:
+            print(f"[Camera] project_world_to_image: Depth is negative")
+            return None
+        
+        pt_2d = self.project_cam_to_image(pt_3d_c)
+        return pt_2d
+
+    def project_cam_to_image(self, pt_3d):
         """
         3D点投影到图像 (不考虑畸变，使用当前 K)
         pt_3d: numpy array shape (3,)
         returns: numpy array shape (2,) [u, v]
         """
-        with self.intrinsic_mutex:
-            # z = pt_3d[2]
-            # if abs(z) < 1e-6: return ... 
-            
-            invz = 1.0 / pt_3d[2]
-            u = self.fx * pt_3d[0] * invz + self.cx
-            v = self.fy * pt_3d[1] * invz + self.cy
-            return np.array([u, v], dtype=np.float32)
+        # z = pt_3d[2]
+        # if abs(z) < 1e-6: return ... 
+        
+        invz = 1.0 / pt_3d[2]
+        u = self.fx * pt_3d[0] * invz + self.cx
+        v = self.fy * pt_3d[1] * invz + self.cy
+        return np.array([u, v], dtype=np.float32)
 
-    def project_cam_to_image_dist(self, pt_3d: np.ndarray) -> np.ndarray:
+    def project_cam_to_image_dist(self, pt_3d):
         """
         3D点投影到图像 (考虑畸变 D)
         相当于 C++ 中的 projectCamToImageDist
         """
-        with self.intrinsic_mutex:
-            # 如果没有畸变系数，直接线性投影
-            if np.all(self.D == 0):
-                return self.project_cam_to_image(pt_3d)
+        # 如果没有畸变系数，直接线性投影
+        if np.all(self.D == 0):
+            return self.project_cam_to_image(pt_3d)
 
-            # OpenCV projectPoints 需要 shape (N, 3) 或 (N, 1, 3)
-            # rvec, tvec 设为 0，因为 pt_3d 已经在相机坐标系下
-            rvec = np.zeros(3)
-            tvec = np.zeros(3)
-            pts = pt_3d.reshape(1, 1, 3).astype(np.float64)
+        # OpenCV projectPoints 需要 shape (N, 3) 或 (N, 1, 3)
+        # rvec, tvec 设为 0，因为 pt_3d 已经在相机坐标系下
+        rvec = np.zeros(3)
+        tvec = np.zeros(3)
+        pts = pt_3d.reshape(1, 1, 3).astype(np.float64)
 
-            if self.model == CameraModel.PINHOLE:
-                img_pts, _ = cv2.projectPoints(pts, rvec, tvec, self.K, self.D)
-                return img_pts.flatten() # [u, v]
+        if self.model == CameraModel.PINHOLE:
+            img_pts, _ = cv2.projectPoints(pts, rvec, tvec, self.K, self.D)
+            return img_pts.flatten() # [u, v]
+        
+        elif self.model == CameraModel.FISHEYE:
+            # fisheye.projectPoints 需要单独处理
+            # 注意：cv2.fisheye.projectPoints 在某些版本可能行为不同，
+            # 这里模仿 C++ 逻辑：先透视除法得到 normalized，再 distort
             
-            elif self.model == CameraModel.FISHEYE:
-                # fisheye.projectPoints 需要单独处理
-                # 注意：cv2.fisheye.projectPoints 在某些版本可能行为不同，
-                # 这里模仿 C++ 逻辑：先透视除法得到 normalized，再 distort
-                
-                # 手动归一化 (x/z, y/z)
-                x = pt_3d[0] / pt_3d[2]
-                y = pt_3d[1] / pt_3d[2]
-                normalized_pt = np.array([[[x, y]]], dtype=np.float64)
-                
-                distorted_pt = cv2.fisheye.distortPoints(normalized_pt, self.K, self.D)
-                return distorted_pt.flatten()
+            # 手动归一化 (x/z, y/z)
+            x = pt_3d[0] / pt_3d[2]
+            y = pt_3d[1] / pt_3d[2]
+            normalized_pt = np.array([[[x, y]]], dtype=np.float64)
             
-            return np.zeros(2)
+            distorted_pt = cv2.fisheye.distortPoints(normalized_pt, self.K, self.D)
+            return distorted_pt.flatten()
+        
+        return np.zeros(2)
 
-    def undistort_image_point(self, pt_2d: np.ndarray) -> np.ndarray:
+    def undistort_image_point(self, pt_2d):
         """
         将畸变图像上的点去畸变
         pt_2d: [u, v]
         """
-        with self.intrinsic_mutex:
-            if np.all(self.D == 0):
-                return pt_2d
+        if np.all(self.D == 0):
+            return pt_2d
 
-            src_pt = pt_2d.reshape(1, 1, 2).astype(np.float64)
-            
-            if self.model == CameraModel.PINHOLE:
-                # undistortPoints 返回的是归一化平面坐标 (x,y)，除非指定了 P (这里用 self.K 作为 P)
-                dst_pt = cv2.undistortPoints(src_pt, self.K, self.D, P=self.K)
-            elif self.model == CameraModel.FISHEYE:
-                dst_pt = cv2.fisheye.undistortPoints(src_pt, self.K, self.D, P=self.K)
-            else:
-                return pt_2d
-            
-            return dst_pt.flatten()
+        src_pt = pt_2d.reshape(1, 1, 2).astype(np.float64)
+        
+        if self.model == CameraModel.PINHOLE:
+            # undistortPoints 返回的是归一化平面坐标 (x,y)，除非指定了 P (这里用 self.K 作为 P)
+            dst_pt = cv2.undistortPoints(src_pt, self.K, self.D, P=self.K)
+        elif self.model == CameraModel.FISHEYE:
+            dst_pt = cv2.fisheye.undistortPoints(src_pt, self.K, self.D, P=self.K)
+        else:
+            return pt_2d
+        
+        return dst_pt.flatten()
+
+    def compute_geometric_attributes(self, raw_pixels):
+        """
+        核心新方法：批量计算特征点的几何属性
+        Input: 
+            raw_pixels: (N, 1, 2) 原始畸变图像上的坐标
+        Output:
+            undistorted_pixels: (N, 1, 2) 去畸变后的像素坐标 (基于新的 self.K)
+            bearing_vectors: (N, 3) 单位方向向量 (x, y, z)
+        """
+        if len(raw_pixels) == 0:
+            return np.empty((0, 1, 2)), np.empty((0, 3))
+
+        # 确保输入是 float 类型
+        src_pts = raw_pixels.astype(np.float64)
+
+        # 1. 计算去畸变后的像素坐标 (用于显示或光流一致性)
+        # 使用 raw_K/raw_D 作为输入， self.K (即 new_K) 作为投影矩阵 P
+        if self.model == CameraModel.PINHOLE:
+            undist_px = cv2.undistortPoints(src_pts, self.K, self.D, P=self.K)
+        elif self.model == CameraModel.FISHEYE:
+            undist_px = cv2.fisheye.undistortPoints(src_pts, self.K, self.D, P=self.K)
+        
+        # 2. 计算归一化坐标 (用于计算 Bearing Vectors)
+        # P=None (或 np.eye(3)) 会返回归一化平面坐标 (x_n, y_n)
+        if self.model == CameraModel.PINHOLE:
+            norm_pts = cv2.undistortPoints(src_pts, self.K, self.D, P=None)
+        elif self.model == CameraModel.FISHEYE:
+            norm_pts = cv2.fisheye.undistortPoints(src_pts, self.K, self.D, P=None)
+        
+        # 3. 将归一化坐标转换为单位 Bearing Vectors
+        # norm_pts shape is (N, 1, 2) -> flatten to (N, 2)
+        xy = norm_pts.reshape(-1, 2)
+        
+        # 添加 z=1
+        # (N, 3)
+        xyz = np.hstack((xy, np.ones((xy.shape[0], 1))))
+        
+        # 归一化为单位向量
+        norms = np.linalg.norm(xyz, axis=1, keepdims=True)
+        bearing_vectors = xyz / norms
+
+        return undist_px.astype(np.float32), bearing_vectors.astype(np.float32)
 
     def update_intrinsic(self, fx, fy, cx, cy):
-        with self.intrinsic_mutex:
-            self.fx = fx
-            self.fy = fy
-            self.cx = cx
-            self.cy = cy
-            self.K = np.array([
-                [self.fx, 0., self.cx],
-                [0., self.fy, self.cy],
-                [0., 0., 1.]
-            ], dtype=np.float64)
-            self.iK = np.linalg.inv(self.K)
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.K = np.array([
+            [self.fx, 0., self.cx],
+            [0., self.fy, self.cy],
+            [0., 0., 1.]
+        ], dtype=np.float64)
+        self.iK = np.linalg.inv(self.K)

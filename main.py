@@ -70,15 +70,27 @@ def main():
     # 使用包装器，在main中进行图像读取
     data_loader = DataloaderWrapper(base_data_loader)
 
+    # 检查是否启用调试模式
+    debug_mode = config.get('debug_single_frame', False)
+    if debug_mode:
+        print("="*60)
+        print("[DEBUG MODE] Single frame debug mode enabled.")
+        print("Each frame will pause after processing. Press Enter to continue.")
+        print("="*60)
+    
     print("Starting SLAM processing...")
     
     try:
         # 遍历dataloader，处理每一帧图像
+        frame_count = 0
         for timestamp, event_type, data in data_loader:
             if event_type == 'IMAGE':
                 image, img_path = data
+                
                 # 在main中调用process_image处理每一帧图像
                 slam_manager.process_image(timestamp, image, img_path)
+                frame_count += 1
+                
             elif event_type == 'IMU':
                 # 处理IMU数据（如果需要）
                 imu_values = data

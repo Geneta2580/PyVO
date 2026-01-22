@@ -7,7 +7,6 @@ class MultiViewGeometry:
     def compute_5pt_essential_matrix(bvs1, bvs2, nmaxiter, errth, do_optimize, fx, fy):
         assert len(bvs1) == len(bvs2), "bvs1 and bvs2 must have the same length"
 
-
         # 1. 数据预处理：Bearing Vector (x,y,z) -> Normalized Plane (x/z, y/z)
         eps = 1e-7
         pts1 = bvs1[:, :2] / (bvs1[:, 2:3] + eps)
@@ -55,27 +54,35 @@ class MultiViewGeometry:
         mask_pose = mask_pose.flatten()
         outliers_idx = np.where(mask_pose == 0)[0].tolist()
 
-        # R, t 是从 Frame 1 到 Frame 2 的变换: x2 = R * x1 + t
-        return True, R, t.flatten(), outliers_idx
+        # R, t 是从 Frame 1 到 Frame 2 的变换: x2 = R * x1 + t  (R_21)
+        R_cv = R
+        t_cv = t.flatten()
+
+        # (R_21) 转换为 (R_12)
+        R_out = R_cv.T
+        t_out = -R_cv.T @ t_cv
+
+        return True, R_out, t_out, outliers_idx
     
     @staticmethod
-    def opencv_p3p_ransac(
+    def p3p_ransac(
         bvs: np.ndarray,       # (N, 3) 归一化方向向量 [x, y, z]
         vwpts: np.ndarray,     # (N, 3) 世界坐标 [X, Y, Z]
         nmaxiter: int = 100,
-        errth: float = 1.0,    # 像素误差阈值
+        errth: float = 3.0,    # 像素误差阈值
         fx: float = 1.0, fy: float = 1.0,
         boptimize: bool = True
-    ) -> Tuple[bool, gtsam.Pose3, List[int]]:
+    ) :
         """
         使用 OpenCV solvePnPRansac 求解位姿
         返回: (success, Pose3_wc, outliers_idx)
         """
         if len(bvs) < 4:
-            return False, gtsam.Pose3(), []
+            print(f"[MultiViewGeometry] P3P RANSAC Failed: Not enough points! len(bvs): {len(bvs)}")
+            return False, np.zeros((4, 4)), []
 
         # 1. 数据准备
-        # 将 Bearing Vectors 转换为归一化平面坐标 (x/z, y/z)
+        # 将 Bearing Vectors 转换为归一化平面齐次坐标 (x/z, y/z)
         # 注意：这里假设内参 K 为单位阵，因为我们用的是归一化坐标
         eps = 1e-7
         z = bvs[:, 2:3]
@@ -102,7 +109,8 @@ class MultiViewGeometry:
         )
 
         if not success or inliers is None or len(inliers) < 5:
-            return False, gtsam.Pose3(), []
+            print(f"[MultiViewGeometry] P3P RANSAC Failed: Not enough inliers (< 5)!")
+            return False, np.zeros((4, 4)), []
 
         # 4. 提取外点索引
         inliers = inliers.flatten()
@@ -132,7 +140,9 @@ class MultiViewGeometry:
         R_wc = R_cw.T
         t_wc = -R_wc @ t_cw
         
-        pose_wc = gtsam.Pose3(gtsam.Rot3(R_wc), gtsam.Point3(t_wc))
+        pose_wc = np.eye(4)
+        pose_wc[:3, :3] = R_wc
+        pose_wc[:3, 3] = t_wc
 
         return True, pose_wc, outliers_idx
 
@@ -140,18 +150,20 @@ class MultiViewGeometry:
     def gtsam_pnp(
         vunkps: np.ndarray,    # (N, 2) 归一化平面坐标
         vwpts: np.ndarray,     # (N, 3) 3D 世界点
-        initial_pose_wc: gtsam.Pose3, # 初始位姿 T_wc
+        initial_pose_wc: np.ndarray, # 初始位姿 T_wc
         nmaxiter: int = 10,
-        chi2th: float = 5.99,  # Chi-square 阈值
-        buse_robust: bool = True,
+        chi2th: float = 5.9915,  # Chi-square 阈值
+        use_robust: bool = True,
         fx: float = 1.0, fy: float = 1.0
-    ) -> Tuple[bool, gtsam.Pose3, List[int]]:
+    ):
         """
         使用 GTSAM 实现 PnP (Motion-only BA)
         替代 C++ 中的 ceresPnP
+        通过对 3D 点添加强约束(Prior)来实现固定点、只优化位姿
         """
         if len(vunkps) != len(vwpts):
-            return False, initial_pose_wc, []
+            print(f"[GTSAM PnP] vunkps and vwpts must have the same length")
+            return False, np.zeros((4, 4)), []
 
         # 1. 构建因子图
         graph = gtsam.NonlinearFactorGraph()
@@ -160,70 +172,126 @@ class MultiViewGeometry:
         # 因为输入是归一化坐标，噪声 sigma 需要归一化：1.0 pixel / fx
         pixel_sigma = 1.0 / ((fx + fy) / 2.0)
         
-        if buse_robust:
-            # Huber 核函数 (Robust Cost Function)
-            # GTSAM 的 robust noise model
-            noise = gtsam.noiseModel.Robust.Create(
+        if use_robust:
+            obs_noise = gtsam.noiseModel.Robust.Create(
                 gtsam.noiseModel.mEstimator.Huber.Create(1.345), # Huber k
                 gtsam.noiseModel.Isotropic.Sigma(2, pixel_sigma)
             )
         else:
-            noise = gtsam.noiseModel.Isotropic.Sigma(2, pixel_sigma)
+            obs_noise = gtsam.noiseModel.Isotropic.Sigma(2, pixel_sigma)
+
+        # 3D点固定噪声
+        point_fixed_noise = gtsam.noiseModel.Constrained.All(3)
 
         # 相机内参 (Cal3_S2)
         # 输入是归一化坐标，所以内参设为 (1, 1, 0, 0, 0)
-        # 也可以直接用 GenericProjectionFactor 配合真实 K，但这里为了匹配 C++ 逻辑
-        # C++ 中是把去畸变后的点投影误差作为残差。
         calib = gtsam.Cal3_S2(1.0, 1.0, 0.0, 0.0, 0.0)
         
-        # 待优化变量 Key
-        pose_key = gtsam.symbol('x', 0)
+        # 初始值
+        initial_estimate = gtsam.Values()
 
+        # 加入位姿初始值
+        pose_key = gtsam.symbol('x', 0)
+        initial_estimate.insert(pose_key, gtsam.Pose3(initial_pose_wc))
+        
         for i in range(len(vunkps)):
-            # 注意：GenericProjectionFactor 也是 T_wc (Pose of camera in world)
-            # 观测点 (u, v)
+            point_key = gtsam.symbol('l', i)
+
+            # 观测数据
             measured = gtsam.Point2(vunkps[i][0], vunkps[i][1])
-            # 3D 点 (常数)
             point3d = gtsam.Point3(vwpts[i])
             
+            # 添加投影因子 (连接 Pose 和 Point)
             factor = gtsam.GenericProjectionFactorCal3_S2(
-                measured, noise, pose_key, point3d, calib
+                measured, obs_noise, pose_key, point_key, calib
             )
             graph.add(factor)
 
-        # 2. 初始值
-        initial_estimate = gtsam.Values()
-        initial_estimate.insert(pose_key, initial_pose_wc)
+            # 添加3D点固定因子
+            graph.add(gtsam.PriorFactorPoint3(point_key, point3d, point_fixed_noise))
 
-        # 3. 优化器配置
+            # 将点的初始值加入estimate
+            initial_estimate.insert(point_key, point3d)
+
+        # 优化器配置
         params = gtsam.LevenbergMarquardtParams()
         params.setMaxIterations(nmaxiter)
         params.setRelativeErrorTol(1e-5)
         # params.setVerbosityLM("SUMMARY") # Debug用
-
-        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_estimate, params)
-        
+    
         try:
+            optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_estimate, params)
             result = optimizer.optimize()
             optimized_pose = result.atPose3(pose_key)
         except Exception as e:
             print(f"[GTSAM PnP] Optimization failed: {e}")
-            return False, initial_pose_wc, []
+            return False, np.zeros((4, 4)), []
 
         # 4. 外点剔除 (根据 Chi2 误差)
         outliers_idx = []
-        # 计算每个因子的误差
-        # graph.error(result) 返回总误差
-        # 我们需要遍历因子计算单个误差
-        
-        for i in range(graph.size()):
-            factor = graph.at(i)
+        # 计算每个因子的误差      
+        for i in range(len(vunkps)):
+            # 或者，因为我们按顺序添加了 N 个 ProjectionFactor 和 N 个 PriorFactor
+            # ProjectionFactor 的索引是 0, 2, 4 ... (偶数)
+            factor_idx = i * 2 
+            factor = graph.at(factor_idx)
+
+            if not isinstance(factor, gtsam.GenericProjectionFactorCal3_S2): 
+                print(f"[GTSAM PnP] Factor {i} is not a GenericProjectionFactorCal3_S2")
+                continue
+
             # error 返回的是 0.5 * (z-h(x))^T * Cov^-1 * (z-h(x))
             # Chi2 error 通常是 2 * error
             err = factor.error(result) * 2.0 
             
-            # C++ 中 chi2th 是直接传进来的 (比如 5.99 对应 95% 2DOF)
             if err > chi2th:
                 outliers_idx.append(i)
 
-        return True, optimized_pose, outliers_idx
+        return True, optimized_pose.matrix(), outliers_idx
+
+    @staticmethod
+    def triangulate_points(
+        T_w_c1: np.ndarray,      # 第一个关键帧的位姿 T_wc (4x4)
+        T_w_c2: np.ndarray,      # 第二个关键帧的位姿 T_wc (4x4)
+        bvs1: np.ndarray,        # 第一个关键帧的 bearing vectors (N, 3)
+        bvs2: np.ndarray,        # 第二个关键帧的 bearing vectors (N, 3)
+    ):
+        """
+        使用两个关键帧的位姿和 bearing vectors 进行三角化
+        返回: (success, points_3d)
+        points_3d: (N, 3) 世界坐标系下的3D点
+        """
+        if len(bvs1) != len(bvs2) or len(bvs1) == 0:
+            return False, np.empty((0, 3))
+
+        # 1. 计算投影矩阵 P1, P2
+        # P = K * [R|t] = K * T_cw (从世界到相机的变换)
+        T_c1_w = np.linalg.inv(T_w_c1)
+        T_c2_w = np.linalg.inv(T_w_c2)
+        
+        P1 = T_c1_w[:3, :]
+        P2 = T_c2_w[:3, :]
+
+        # 2. 将 bearing vectors 转换为归一化平面坐标 (用于三角化)
+        # bearing vector [x, y, z] -> 归一化坐标 [x/z, y/z]
+        eps = 1e-7
+        z1 = bvs1[:, 2:3]
+        z1[np.abs(z1) < eps] = eps
+        pts1_norm = bvs1[:, :2] / z1  # (N, 2)
+
+        z2 = bvs2[:, 2:3]
+        z2[np.abs(z2) < eps] = eps
+        pts2_norm = bvs2[:, :2] / z2  # (N, 2)
+
+        # 3. 三角化
+        # OpenCV triangulatePoints 需要 (2, N) 格式
+        pts1_2d = pts1_norm.T  # (2, N)
+        pts2_2d = pts2_norm.T  # (2, N)
+
+        # 三角化
+        points_4d = cv2.triangulatePoints(P1, P2, pts1_2d, pts2_2d)  # (4, N)
+
+        # 4. 转换为3D点 (齐次坐标 -> 3D坐标)
+        points_3d = (points_4d[:3, :] / (points_4d[3, :] + eps)).T  # (N, 3)
+
+        return True, points_3d

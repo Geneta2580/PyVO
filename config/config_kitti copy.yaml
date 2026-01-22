@@ -5,10 +5,10 @@
 # euroc：/home/pangjunxiang/dataset/Euroc/MH_01_easy
 # tum：/home/pangjunxiang/dataset/TUM/freiburg1
 # kitti:
-dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0033_sync"
+dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0027_sync"
 
 # 支持euroc\tum\kitti数据集
-dataset_type: "kitti"
+dataset_type: "euroc"
 
 # ============================================= 视觉前端配置参数 =============================================
 # 相机内参
@@ -30,7 +30,7 @@ image_height: 376
 max_features_to_detect: 300
 
 # 特征点的最小距离
-min_dist: 35
+nmaxdist: 35
 
 # CLAHE参数
 use_clahe: True
@@ -60,7 +60,7 @@ triangulation_min_depth: 0.1 # 新地图点三角化最小深度
 
 # ============================================= 调试模式配置 =============================================
 # 单帧运行debug模式：设置为True时，每处理一帧后暂停，等待用户输入继续
-debug_single_frame: False
+debug_single_frame: True
 
 # 可视化光流追踪结果：设置为True时，显示光流追踪的可视化结果
 visualize_optical_flow: True

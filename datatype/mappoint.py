@@ -23,6 +23,10 @@ class MapPoint:
         if kf_id in self.observations:
             del self.observations[kf_id]
 
+    def set_triangulated(self, position_3d):
+        self.position_3d = position_3d
+        self.status = MapPointStatus.TRIANGULATED
+
     def get_observation_count(self):
         return len(self.observations)
 
@@ -32,9 +36,8 @@ class MapPoint:
     def get_observation(self, kf_id):
         return self.observations[kf_id]
 
-    def set_triangulated(self, position_3d):
-        self.position_3d = position_3d
-        self.status = MapPointStatus.TRIANGULATED
+    def get_point(self):
+        return self.position_3d
 
     def is_ready_for_triangulation(self, keyframe_window, min_parallax):
         # 必须是候选点，且至少有2个观测
