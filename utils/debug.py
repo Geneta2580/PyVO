@@ -14,6 +14,12 @@ class Debugger:
         
         self.column_names = list(column_names) # 使用传入的列名
 
+        self.base_columns = ["timestamp"]
+        if column_names:
+            # 过滤掉可能重复的 timestamp
+            self.base_columns += [c for c in column_names if c != "timestamp"]
+        self.current_columns = list(self.base_columns)
+
         # 使用有序字典保持时间顺序
         self.data_cache = collections.OrderedDict()
 
@@ -24,10 +30,10 @@ class Debugger:
         self.log_file = open(self.log_path, 'w', newline='')
 
         # 打开文件并写入表头
-        self.writer = csv.DictWriter(self.log_file, fieldnames=self.column_names)
-        self.writer.writeheader()
-        self.log_file.flush()
-        print(f"【Debugger】: Log file initialized at {self.log_path} with columns {self.column_names}")
+        self.file_handle = open(self.log_path, 'w', newline='', encoding='utf-8')
+        self.writer = None # 延迟初始化，因为列名可能会增加
+        
+        print(f"【Debugger】: Initialized at {self.log_path}")
 
     def _initialize_log_file(self, prefix, log_dir, use_timestamp):
         if use_timestamp:
@@ -62,7 +68,7 @@ class Debugger:
         ts = round(float(timestamp), 6) 
         
         if ts not in self.data_cache:
-            self.data_cache[ts] = {"timestamp": ts}
+            self.data_cache[ts] = {"timestamp": f"{ts:.6f}"}
         
         # 更新数据
         self.data_cache[ts][key] = value
@@ -70,6 +76,31 @@ class Debugger:
         # 动态添加列名（如果输入了之前没定义过的 key）
         if key not in self.column_names:
             self.column_names.append(key)
+
+    def finish_frame(self, timestamp):
+        """
+        显式调用：表示这一帧的数据记录完了，可以写入文件。
+        SLAM 每帧结束时调用一次。
+        """
+        ts = round(float(timestamp), 6)
+        if ts not in self.data_cache:
+            return
+
+        # 第一次写入时初始化 writer
+        if self.writer is None:
+            self.writer = csv.DictWriter(self.file_handle, fieldnames=self.current_columns)
+            self.writer.writeheader()
+
+        # 获取这一行的数据
+        row_data = self.data_cache[ts]
+        # 补齐缺失的列，防止 DictWriter 报错
+        complete_row = {col: row_data.get(col, '') for col in self.current_columns}
+        
+        self.writer.writerow(complete_row)
+        self.file_handle.flush() # 确保实时写入
+        
+        # 写入后从缓存删除，释放内存
+        del self.data_cache[ts]
 
     def log(self, value):
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
@@ -145,6 +176,7 @@ class Debugger:
         如果成功，返回文件句柄；如果发生错误，则返回None。
         """
         try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
             file_handle = open(output_path, 'w')
             # 写入TUM格式的头部信息
             file_handle.write("# timestamp tx ty tz qx qy qz qw\n")

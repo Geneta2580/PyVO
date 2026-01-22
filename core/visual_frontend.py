@@ -15,7 +15,7 @@ class MotionModel:
         self.prev_T_wc = None  # 存储为 gtsam.Pose3 对象
         # 存储速度矢量 (6x1: rotation + translation)
         self.log_rel_T_wc = np.zeros(6)
-        self.traj_file = Debugger.initialize_trajectory_file("/output/trajectory_tum.txt")
+        self.traj_file = Debugger.initialize_trajectory_file("./output/trajectory_tum.txt")
 
     def apply_motion_model(self, T_wc_np, time):
         T_wc = gtsam.Pose3(T_wc_np)
@@ -92,12 +92,27 @@ class VisualFrontend:
 
         # 日志
         log_columns = [
-            "timestamp",
-            "visual_tracking_is_new_kf",
-            "visual_tracking_n_tracked_valid_3d",
-            "visual_tracking_n_tracked_valid_3d_ratio",
-            "visual_tracking_n_tracked_valid_3d_ratio",
-        ]
+            "id",
+            "ref_kf_id",
+            "visual_tracking_constant_vel_prior_valid_3d",
+            "visual_tracking_3d_tracked_count",
+            "visual_tracking_3d_tracked_ratio",
+            "visual_tracking_2d_tracked_count",
+            "visual_tracking_2d_tracked_ratio",
+            "epipolar_filtering_avg_parallax",
+            "epipolar_filtering_success",
+            "epipolar_filtering_outliers_count",
+            "epipolar_filtering_outliers_count_ratio",
+            "p3p_ransac_success",
+            "p3p_ransac_inliers_count",
+            "p3p_ransac_inliers_count_ratio",
+            "gtsam_pnp_inliers_count",
+            "gtsam_pnp_inliers_count_ratio",
+            "check_new_keyframe_is_kf_required",
+            "check_new_keyframe_med_rot_parallax",
+            "check_new_keyframe_n_frames_since_kf",
+            "check_new_keyframe_n_visual_features_num",
+        ] 
         self.logger = Debugger(config, file_prefix="visual_frontend", column_names=log_columns)
 
     def reset(self):
@@ -193,6 +208,9 @@ class VisualFrontend:
         # 更新
         self.prev_frame = self.cur_frame
         self.prev_gray = curr_gray
+
+        # 记录日志
+        self.logger.finish_frame(timestamp)
 
         # 返回关键帧判断结果和灰度图（用于后续关键帧创建）
         return is_new_kf, curr_gray
@@ -843,7 +861,9 @@ class VisualFrontend:
             self.logger.log_flexible(self.cur_frame.timestamp, "p3p_ransac_inliers_count_ratio", n_inliers / len(np_bvs))
 
             if not success or n_inliers < 5:
-                print("[VisualFrontEnd Compute Pose] P3P Failed or not enough inliers. Resetting.")
+                print(f'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Warning !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+                print(f'[VisualFrontEnd Compute Pose] P3P Failed or not enough inliers. Resetting.')
+                print(f'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Warning !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
                 self.logger.log_flexible(self.cur_frame.timestamp, "p3p_ransac_inliers_count", 0)
                 self.logger.log_flexible(self.cur_frame.timestamp, "p3p_ransac_inliers_count_ratio", 0.0)
                 # 此时cur_frame.T_w_c，还是使用的运动模型预测位姿
@@ -886,7 +906,9 @@ class VisualFrontend:
         # 检查优化结果有效性
         if not success or n_inliers < 5 or len(outliers_idx) > 0.5 * len(np_kps):
             # 如果单目模式下 P3P 后优化依然挂了，重置
-            print("[VisualFrontEnd Compute Pose] Optimization failed after P3P. Resetting.")
+            print(f'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Warning !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+            print("[VisualFrontEnd Compute Pose] GTSAM PnP optimization failed after P3P. Resetting.")
+            print(f'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Warning !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
             self.logger.log_flexible(self.cur_frame.timestamp, "gtsam_pnp_inliers_count", 0)
             self.logger.log_flexible(self.cur_frame.timestamp, "gtsam_pnp_inliers_count_ratio", 0.0)
             # self.reset_frame()
@@ -991,9 +1013,10 @@ class VisualFrontend:
         # 最终判断: 满足任意核心条件 (c0/c1/c2) 且 满足基础视差条件 (cx)
         is_kf_required = (c0 or c1 or c2) and cx
 
+        kf_flag = 1 if is_kf_required else 0
         self.logger.log_flexible(self.cur_frame.timestamp, "id", self.cur_frame.get_id())
         self.logger.log_flexible(self.cur_frame.timestamp, "ref_kf_id", self.cur_frame.ref_kf_id)
-        self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_is_kf_required", is_kf_required)
+        self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_is_kf_required", kf_flag)
         self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_med_rot_parallax", med_rot_parallax)
         self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_n_frames_since_kf", n_frames_since_kf)
         self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_n_visual_features_num", visual_features_num)
