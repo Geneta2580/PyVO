@@ -1,12 +1,16 @@
 import cv2
+import numpy as np
 from datatype.camera import CameraCalibration
 from datatype.frame import Frame
 from datatype.map_manager import MapManager
+from datatype.mappoint import MapPointStatus
 import queue
 from core.feature_extractor import FeatureExtractor
 from core.feature_tracker import FeatureTracker
 from core.visual_frontend import VisualFrontend
 from core.mapper import Mapper
+# from core.backend import Backend
+from utils.viewer import Viewer
 
 class SLAMManager:
     def __init__(self, config):
@@ -37,18 +41,30 @@ class SLAMManager:
                                               self.feature_tracker, self.feature_extractor, self.mapper)
 
         # 初始化其他线程
-        self.keyframe_queue = queue.Queue(maxsize=20)
-        # ...
+        if self.config.get('use_viewer', True):
+            self.viewer = Viewer(self.config)
+        else:
+            self.viewer = None
+        
+        # self.backend = Backend(self.config, self.map_manager)
 
         self.is_running = True
 
     def start_all_threads(self):
         self.is_running = True
-        print("[SLAMManager] All threads started.")
+        if self.viewer is not None:
+            self.viewer.start()
+            print("[SLAMManager] All threads started.")
+        else:
+            print("[SLAMManager] Viewer not initialized, skipping thread start.")
 
     def stop_all_threads(self):
         self.is_running = False
-        print("[SLAMManager] All threads stopped.")
+        if self.viewer is not None:
+            self.viewer.stop()
+            print("[SLAMManager] All threads stopped.")
+        else:
+            print("[SLAMManager] Viewer not initialized, skipping thread stop.")
 
     def process_image(self, timestamp, image, img_path):
         """
@@ -81,6 +97,8 @@ class SLAMManager:
         if not is_keyframe and not self.visual_frontend.visual_init_ready:
             # 初始化失败，重置所有状态
             print(f"[SLAMManager] Initialization failed, resetting all components...")
+            # 在重置前，尝试更新viewer显示当前状态
+            self._update_viewer_safe()
             self.reset()
             return
 
@@ -90,6 +108,41 @@ class SLAMManager:
             self._create_keyframe(curr_gray)
 
         self.prev_frame = self.cur_frame
+        
+        # 更新viewer显示
+        self._update_viewer_safe()
+    
+    def _update_viewer_safe(self):
+        """
+        安全地更新viewer，包含错误处理
+        """
+        if self.viewer is not None:
+            if not self.viewer.is_alive():
+                print("[SLAMManager] Warning: Viewer thread is not alive!")
+                return
+            
+            try:
+                # 获取当前帧位姿
+                T_wc = self.cur_frame.get_T_w_c()
+                
+                # 获取局部地图点 (local_mappoints)
+                local_mappoints_dict = self.map_manager.get_active_mappoints()
+                local_points = np.array(list(local_mappoints_dict.values())) if len(local_mappoints_dict) > 0 else None
+                
+                # 获取全局地图点 (global_mappoints)
+                global_mappoints_dict = self.map_manager.get_global_mappoints()
+                global_points = np.array(list(global_mappoints_dict.values())) if len(global_mappoints_dict) > 0 else None
+                
+                # 更新viewer（包含数据有效性检查）
+                self.viewer.update_data(
+                    T_wc, 
+                    local_points_3d=local_points,
+                    global_points_3d=global_points
+                )
+            except Exception as e:
+                print(f"[SLAMManager] Error updating viewer: {e}")
+                import traceback
+                traceback.print_exc()
         
         # 调试模式：单帧运行，等待用户输入
         if self.debug_single_frame:
@@ -134,6 +187,23 @@ class SLAMManager:
                     self.reset()
                     self.prev_frame = None
                     return
+
+    def update_viewer(self):
+        if self.viewer is not None and self.viewer.is_alive():
+            # 获取局部地图点 (local_mappoints)
+            local_mappoints_dict = self.map_manager.get_active_mappoints()
+            local_points = np.array(list(local_mappoints_dict.values())) if len(local_mappoints_dict) > 0 else None
+            
+            # 获取全局地图点 (global_mappoints)
+            global_mappoints_dict = self.map_manager.get_global_mappoints()
+            global_points = np.array(list(global_mappoints_dict.values())) if len(global_mappoints_dict) > 0 else None
+            
+            # 更新viewer
+            self.viewer.update_data(
+                self.cur_frame.get_T_w_c(), 
+                local_points_3d=local_points,
+                global_points_3d=global_points
+            )
 
     def reset(self):
         """

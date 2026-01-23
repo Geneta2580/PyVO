@@ -3,7 +3,7 @@ import numpy as np
 import cv2
 import gtsam
 from utils.geometry import MultiViewGeometry
-from utils.visualization import visualize_optical_flow_tracking
+from utils.visualization import visualize_optical_flow_tracking, visualize_epipolar_filtered_tracking
 from datatype.mappoint import MapPointStatus
 from utils.debug import Debugger
 
@@ -169,7 +169,6 @@ class VisualFrontend:
             T_wc_prev = self.prev_frame.get_T_w_c()
         else:
             assert False, "[VisualFrontend] [Error]: Previous frame should not be None"
-            T_wc_prev = np.eye(4)
         
         T_wc_pred = self.motion_model.apply_motion_model(T_wc_prev, timestamp)
         self.cur_frame.set_T_w_c(T_wc_pred)
@@ -246,7 +245,7 @@ class VisualFrontend:
                 # 投影: World -> Image (Distorted) 这里的 T_cw是基于恒速模型预测的位姿
                 proj_px = self.cur_frame.camera.project_world_to_image(self.cur_frame.get_T_w_c(), map_point.get_point())
 
-                # 检查投影点是否在图像内
+                # 检查投影点是否在图像内（深度有可能为负，或者超出图像范围）
                 if self.cur_frame.camera.is_in_image(proj_px):
                     valid_3d_kps_px.append(flat_kp)
                     valid_3d_priors.append(proj_px.flatten())
@@ -332,6 +331,7 @@ class VisualFrontend:
             self.logger.log_flexible(self.cur_frame.timestamp, "visual_tracking_3d_tracked_count", nb_good_3d)
             self.logger.log_flexible(self.cur_frame.timestamp, "visual_tracking_3d_tracked_ratio", nb_good_3d / len(valid_3d_kps_px))
 
+            # 如果3D点跟踪数量不足，则使用P3P进行位姿优化，同时所有2D点都使用上一帧对应点的像素坐标作为预测坐标
             if nb_good_3d < 0.33 * len(valid_3d_kps_px):
                 self.do_p3p = True
                 valid_2d_priors = valid_2d_kps_px
@@ -464,7 +464,6 @@ class VisualFrontend:
             # 收集数据 (用于后续 E 矩阵计算)
             # 注意：cv2.findEssentialMat 需要像素坐标或归一化坐标
             # 这里我们收集归一化平面坐标 (unpx)
-            # kp.unpx 是 [x, y] 去畸变后的像素坐标，我们需要转为归一化坐标 x_n = (x-cx)/fx
             # 但 kp.bv 已经是归一化方向向量 [x, y, z]，直接用 x/z, y/z 即可
             
             # 存储相机归一化向量
@@ -597,6 +596,18 @@ class VisualFrontend:
                 kf_id=self.cur_frame.ref_kf_id
             )
             cv2.imshow("KLT Tracking (With Inliers)", vis_img)
+            
+            # 显示对极约束过滤后的纯净追踪图像（只显示内点，绿色箭头）
+            vis_img_clean = visualize_epipolar_filtered_tracking(
+                curr_image_bgr,
+                self.tracking_prev_pts, self.tracking_tracked_pts, self.tracking_final_status,
+                inliers_mask=inliers_mask,
+                window_name="Epipolar Filtered Tracking (Inliers Only)",
+                show_stats=True,
+                frame_id=self.cur_frame.get_id(),
+                kf_id=self.cur_frame.ref_kf_id
+            )
+            cv2.imshow("Epipolar Filtered (Clean)", vis_img_clean)
             cv2.waitKey(1)  # 非阻塞显示
 
         # TODO：单目模式下的位姿恢复（这里可以直接考虑替换VGGT）
@@ -724,6 +735,7 @@ class VisualFrontend:
 
         # 设置初始位姿 (人为设定尺度)
         # normalize t and apply scale
+        # TODO: 调大试试？
         t_ref_cur_scaled = t_ref_cur / np.linalg.norm(t_ref_cur)
         t_ref_cur_scaled = t_ref_cur_scaled * 0.25 # Arbitrary scale for initialization (e.g. baseline)
 

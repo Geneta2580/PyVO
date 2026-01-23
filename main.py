@@ -67,6 +67,9 @@ def main():
     # 实例化所有模块
     slam_manager = SLAMManager(config)
 
+    # 启动所有线程（包括viewer线程）
+    slam_manager.start_all_threads()
+
     # 使用包装器，在main中进行图像读取
     data_loader = DataloaderWrapper(base_data_loader)
 
@@ -100,6 +103,8 @@ def main():
         print("\n[Main Process] Caught KeyboardInterrupt, initiating shutdown...")
     finally:
         print("[Main Process] Shutting down all components...")
+        # 停止所有线程（包括viewer线程）
+        slam_manager.stop_all_threads()
         cv2.destroyAllWindows()
         print("[Main Process] SLAM system shut down.")
 

@@ -5,7 +5,7 @@
 # euroc：/home/pangjunxiang/dataset/Euroc/MH_01_easy
 # tum：/home/pangjunxiang/dataset/TUM/freiburg1
 # kitti:
-dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0020_sync"
+dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0027_sync"
 
 # 支持euroc\tum\kitti数据集
 dataset_type: "kitti"
@@ -68,12 +68,9 @@ visualize_optical_flow: True
 # open3d可视化
 use_viewer: True
 # Open3D初始显示范围（单位：米），控制窗口的初始视图范围
+# 值越大，初始显示范围越大，能看到更大的场景
 # 建议值：50-200（小场景），200-500（中等场景），500-1000（大场景）
 viewer_initial_range: 200.0
-# 是否显示历史相机位姿（灰色小相机）
-viewer_show_history_cameras: True
-# 最多显示的历史相机数量（避免性能问题）
-viewer_max_history_cameras: 100
 
 # ============================================= 输出结果配置 =============================================
 log_dir: "output/log"

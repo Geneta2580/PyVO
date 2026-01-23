@@ -198,8 +198,8 @@ class MultiViewGeometry:
             point_key = gtsam.symbol('l', i)
 
             # 观测数据
-            measured = gtsam.Point2(vunkps[i][0], vunkps[i][1])
-            point3d = gtsam.Point3(vwpts[i])
+            measured = vunkps[i]
+            point3d = vwpts[i]
             
             # 添加投影因子 (连接 Pose 和 Point)
             factor = gtsam.GenericProjectionFactorCal3_S2(

@@ -34,12 +34,12 @@ class Mapper:
             # 这里虽然会同时找local和global,但理论不可能找到global的点，因为追踪是连续的
             mappoint = self.map_manager.get_map_point(mp_id)
             if mappoint is None:
-                print(f"[Mapper] Mappoint {mp_id} not found in map_manager")
+                # print(f"[Mapper] Mappoint {mp_id} not found in map_manager")
                 continue
             
             # 只处理 CANDIDATE 状态的路标点，不重复三角化
             if mappoint.status != MapPointStatus.CANDIDATE:
-                print(f"[Mapper] Mappoint {mp_id} not in CANDIDATE status")
+                # print(f"[Mapper] Mappoint {mp_id} not in CANDIDATE status")
                 continue
 
             # 获取所有观测该路标点的关键帧ID
