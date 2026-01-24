@@ -57,9 +57,6 @@ def main():
     # 启动一个spawn主进程
     mp.set_start_method('spawn', force=True)
 
-    # 创建队列
-    image_queue = queue.Queue(maxsize=20)
-
     # 初始化数据加载器
     dataloader_config = {'path': config['dataset_path'], 'dataset_type': config['dataset_type']}
     base_data_loader = UnifiedDataloader(dataloader_config)

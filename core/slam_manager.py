@@ -9,7 +9,7 @@ from core.feature_extractor import FeatureExtractor
 from core.feature_tracker import FeatureTracker
 from core.visual_frontend import VisualFrontend
 from core.mapper import Mapper
-# from core.backend import Backend
+from core.optimizer import Optimizer
 from utils.viewer import Viewer
 
 class SLAMManager:
@@ -41,13 +41,15 @@ class SLAMManager:
                                               self.feature_tracker, self.feature_extractor, self.mapper)
 
         # 初始化其他线程
+        # 优化器
+        self.optimizer = Optimizer(self.config, self.map_manager)
+        
+        # 可视化
         if self.config.get('use_viewer', True):
             self.viewer = Viewer(self.config)
         else:
             self.viewer = None
         
-        # self.backend = Backend(self.config, self.map_manager)
-
         self.is_running = True
 
     def start_all_threads(self):
@@ -179,6 +181,10 @@ class SLAMManager:
         if self.mapper is not None:
             self.mapper.triangulate(self.cur_frame)
             n_active_kfs = len(self.map_manager.active_keyframes)
+
+            if n_active_kfs > 3:
+                self.optimizer.optimize()
+
             # 检查初始化质量（初始化完成后(至少两帧，防止重置死循环)，第一个滑窗满之前，检查地图点数量）
             if len(self.map_manager.global_keyframes) == 0 and n_active_kfs > 2:
                 if self.mapper.check_initialization_quality(self.visual_frontend.visual_init_ready):

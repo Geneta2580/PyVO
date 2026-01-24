@@ -5,7 +5,7 @@
 # euroc：/home/pangjunxiang/dataset/Euroc/MH_01_easy
 # tum：/home/pangjunxiang/dataset/TUM/freiburg1
 # kitti:
-dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0020_sync"
+dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0027_sync"
 
 # 支持euroc\tum\kitti数据集
 dataset_type: "kitti"
