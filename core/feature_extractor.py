@@ -1,104 +1,236 @@
+from pyexpat import features
 import cv2
 import numpy as np
+import math
 
 class FeatureExtractor:
     def __init__(self, config):
         self.config = config
-        self.min_dist = self.config.get('min_dist', 25)
-        self.max_features_to_detect = self.config.get('max_features_to_detect', 200)
+
+        self.max_features_to_detect = self.config.get('max_features_to_detect', 250)
+        self.cell_size = self.config.get('grid_cell_size', 35)
+        self.quality_level = self.config.get('max_quality_level', 0.001)
+        
+        width = self.config.get('image_width', 752)
+        height = self.config.get('image_height', 480)
+        n_w_cells = math.ceil(width / self.cell_size)
+        n_h_cells = math.ceil(height / self.cell_size)
+        self.max_kps = int(n_w_cells * n_h_cells)
+
+        # TODO：这里似乎OV2SLAM写的很简单
+        self.orb = cv2.ORB_create(
+            nfeatures=self.max_features_to_detect * 2,
+            scoreType=cv2.ORB_FAST_SCORE,
+            patchSize=31,
+            fastThreshold=20
+        )
+        
         self.next_feature_id = 0
 
     def extract_features(self, frame, gray_image):
         img_h, img_w = gray_image.shape
 
-        # 第一帧处理（无历史特征）
-        if frame.id == 0:
-            new_features = self.detect_features(gray_image, self.max_features_to_detect, mask=None)
-            if new_features is not None:
-                self._add_new_features_to_frame(frame, new_features)
-            return
-
-        # 后续帧处理
-        # 获取当前帧已有的特征点（通常是光流跟踪后的结果）
+        # 1.准备已有特征点（光流追踪后的结果）
         current_features = frame.get_visual_features()
-        current_ages = frame.visual_feature_ages
+        current_pts = []
+        # print(f"[FeatureExtractor] current_features: {len(current_features)}")
+        if len(current_features) > 0:
+            current_pts = current_features[:, 0, :] # (N, 2)
 
-        # --- 核心修改：生成保留掩膜和占用掩膜 ---
-        keep_mask, occupancy_mask = self.filter_features_by_age(
-            current_features, current_ages, (img_h, img_w)
-        )
+            # 计算光流追踪的描述子
+            tracked_descs, valid_mask = self._compute_descriptors(gray_image, current_features)
+            
+            # 如果部分点移到了图像边缘无法计算描述子，必须将其剔除
+            # 否则它们会占用网格，但实际上已经不可用了
+            if not np.all(valid_mask):
+                frame.remove_outliers_by_mask(valid_mask)
+                
+                # 剔除后必须同步更新 current_pts，否则 mask 会错误地屏蔽掉空闲区域
+                current_features = frame.get_visual_features()
+                if len(current_features) > 0:
+                    current_pts = current_features[:, 0, :]
+                else:
+                    current_pts = []
+                
+                # valid_mask 已经对齐了 tracked_descs，所以描述子列表是纯净的
+                tracked_descs = tracked_descs 
 
-        frame.remove_outliers_by_mask(keep_mask)
+            # 将更新后的描述子存入 Frame
+            if len(frame.get_visual_features()) > 0:
+                frame.descriptors = tracked_descs
 
-        # 补充新特征点
-        # 计算还需要多少特征点
-        current_num = np.sum(keep_mask) # 统计 True 的数量
-        new_features_needed = self.max_features_to_detect - current_num
+        features_needed = self.max_kps - frame.get_n_occupied_cells()
+        # print(f"[FeatureExtractor] features_needed: {features_needed}")
+        if features_needed > 0:
+            # 2.调用Single Scale Grid Detect提取新点
+            new_pts = self.detect_single_scale(gray_image, current_pts)
 
-        if new_features_needed > 0:
-            # 使用生成的 occupancy_mask (已包含了保留特征点的覆盖区域) 进行检测
-            new_features = self.detect_features(gray_image, new_features_needed, occupancy_mask)
-            if new_features is not None:
-                self._add_new_features_to_frame(frame, new_features)
+            # 3.计算新点描述子并添加
+            if len(new_pts) > 0:
+                # 格式转换 list -> (N, 1, 2)
+                new_features_np = np.array(new_pts, dtype=np.float32).reshape(-1, 1, 2)
+                new_descs, valid_mask = self._compute_descriptors(gray_image, new_features_np)
+                
+                final_features = new_features_np[valid_mask]
+                if len(final_features) > 0:
+                    self._add_new_features_to_frame(frame, final_features, new_descs)
 
-    def detect_features(self, image, max_corners, mask):
-        """OpenCV 特征点提取封装"""
-        if max_corners <= 0:
-            return None
-        
-        features = cv2.goodFeaturesToTrack(
-            image,
-            maxCorners=max_corners,
-            qualityLevel=0.01,
-            minDistance=self.min_dist,
-            blockSize=7,
-            mask=mask
-        )
-        return features
-
-    def filter_features_by_age(self, features, feature_ages, image_shape):
+    def detect_single_scale(self, image, current_pts):
         """
-        根据 Age 优先级生成保留掩膜。
-        不重新创建点列表，而是返回 keep_mask 和 occupancy_mask。
+        基于网格的单尺度特征检测
+        包含：网格占用检查、每个网格最多取2点、动态阈值调整、亚像素优化。
         """
-        n_features = len(features)
+        h, w = image.shape
+        cell_size = self.cell_size
         
-        # 1. 初始化掩膜
-        # keep_mask: True 表示保留，False 表示删除
-        keep_mask = np.zeros(n_features, dtype=bool)
-        # occupancy_mask: 用于 goodFeaturesToTrack，255 表示可检测区域
-        occupancy_mask = np.full(image_shape, 255, dtype=np.uint8)
-
-        if n_features == 0:
-            return keep_mask, occupancy_mask
-
-        # 2. 获取排序索引 (Age 降序)
-        sorted_indices = np.argsort(feature_ages)[::-1]
-
-        # 3. 按照优先级遍历并填充 Mask      
-        pts = features[:, 0, :].astype(np.int32)
+        # 1. 网格初始化
+        n_rows = int(h / cell_size)
+        n_cols = int(w / cell_size)
+        n_cells = n_rows * n_cols
+        n_half_cell = int(cell_size / 4)
         
-        h, w = image_shape
+        # 2. 占用标记 (Occupancy)
+        # voccupcells[row][col] = True/False
+        occupied_cells = np.zeros((n_rows + 1, n_cols + 1), dtype=bool)
+        
+        # Mask: 用于防止特征点过近 (OpenCV minMaxLoc 支持 mask)
+        mask = np.full((h, w), 255, dtype=np.uint8)
+        
+        if len(current_pts) > 0:
+            pts_int = np.round(current_pts).astype(np.int32)
+            for pt in pts_int:
+                c, r = pt[0] // cell_size, pt[1] // cell_size
+                if 0 <= r < n_rows and 0 <= c < n_cols:
+                    occupied_cells[r, c] = True
+                
+                # 在 Mask 上画黑圈，防止新点离老点太近
+                cv2.circle(mask, tuple(pt), n_half_cell, 0, -1)
+                
+        # 3. 全局预处理 (优化点：Python 循环慢，先全局算 EigenMap)
+        blurred_img = cv2.GaussianBlur(image, (3, 3), 0)
+        eigen_map = cv2.cornerMinEigenVal(blurred_img, 3, 3)
+        
+        primary_detections = []   # 每个格子的第一优选
+        secondary_detections = [] # 每个格子的第二优选 (备胎)
+        nb_occupied_count = 0
+        
+        # 4. 遍历网格 (Grid Iteration)
+        for r in range(n_rows):
+            for c in range(n_cols):
+                
+                # 如果该格子已经被老点占了，跳过
+                if occupied_cells[r, c]:
+                    nb_occupied_count += 1
+                    continue
+                
+                # 定义 ROI 坐标
+                x0, y0 = c * cell_size, r * cell_size
+                x1, y1 = min(x0 + cell_size, w), min(y0 + cell_size, h)
+                
+                # 获取 ROI 切片
+                roi_eigen = eigen_map[y0:y1, x0:x1]
+                roi_mask = mask[y0:y1, x0:x1]
+                
+                # --- 第一轮检测 (Primary) ---
+                min_v, max_v, min_loc, max_loc = cv2.minMaxLoc(roi_eigen, mask=roi_mask)
+                
+                # 检查质量阈值 (动态阈值 dmaxquality_)
+                if max_v >= self.quality_level:
+                    # max_loc 是 ROI 内的局部坐标，需转为全局
+                    pt_global = (x0 + max_loc[0], y0 + max_loc[1])
+                    
+                    # 边界检查 (排除太靠边的点)
+                    if 5 < pt_global[0] < w - 5 and 5 < pt_global[1] < h - 5:
+                        primary_detections.append(pt_global)
+                        
+                        # 在 Mask 上把这个点扣掉，以便找第二个点
+                        # 注意：需要修改 roi_mask，这会影响原 mask 数组吗？
+                        # numpy 切片是视图，修改 roi_mask 会影响 mask，这正是我们要的
+                        cv2.circle(roi_mask, max_loc, n_half_cell, 0, -1)
+                        
+                        # --- 第二轮检测 (Secondary) ---
+                        min_v2, max_v2, min_loc2, max_loc2 = cv2.minMaxLoc(roi_eigen, mask=roi_mask)
+                        
+                        if max_v2 >= self.quality_level:
+                            pt2_global = (x0 + max_loc2[0], y0 + max_loc2[1])
+                            if 5 < pt2_global[0] < w - 5 and 5 < pt2_global[1] < h - 5:
+                                secondary_detections.append(pt2_global)
 
-        for idx in sorted_indices:
-            x, y = pts[idx]
+        # 5. 结果聚合 (Aggregation)
+        final_pts = []
+        final_pts.extend(primary_detections)
+        
+        nb_kps = len(final_pts)
+        
+        # 如果第一轮检测完，点还是不够 (填不满网格)，就用第二轮的备胎来凑
+        if nb_kps + nb_occupied_count < n_cells:
+            nb_needed = n_cells - (nb_kps + nb_occupied_count)
+            # 取前 nb_needed 个备胎
+            final_pts.extend(secondary_detections[:nb_needed])
+            
+        # 6. 动态阈值调整 (Adaptive Thresholding)
+        # 如果这次找到的点太少 (< 33% 空闲格子)，说明标准太高了，下次降低标准
+        # 如果这次找到的点太多 (> 90% 空闲格子)，说明标准太低了，下次提高标准
+        
+        current_total = len(final_pts)
+        free_cells = n_cells - nb_occupied_count
+        
+        if free_cells > 0:
+            if current_total < 0.33 * free_cells:
+                self.quality_level /= 2.0
+                # print(f"[FeatExtract] Quality too high, reducing to {self.quality_level}")
+            elif current_total > 0.90 * free_cells:
+                self.quality_level *= 1.5
+                # print(f"[FeatExtract] Quality too low, increasing to {self.quality_level}")
+        
+        # 7. 亚像素优化 (Sub-Pixel Refinement)
+        if len(final_pts) > 0:
+            pts_np = np.array(final_pts, dtype=np.float32)
+            
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
+            cv2.cornerSubPix(image, pts_np, (3, 3), (-1, -1), criteria)
+            
+            # 转回 list 或保持 numpy 都可以，这里返回 list 保持接口一致
+            # print(f"[FeatureExtractor] final_pts: {len(final_pts)}")
+            return pts_np.tolist()
+            
+        return []
 
-            # 边界检查
-            if 0 <= x < w and 0 <= y < h:
-                # 如果该位置在 mask 中是 255 (未被占用)
-                if occupancy_mask[y, x] == 255:
-                    # 标记保留
-                    keep_mask[idx] = True
-                    # 在 mask 上画圆，占据位置
-                    cv2.circle(occupancy_mask, (x, y), self.min_dist, 0, -1)
-            else:
-                # 超出边界的点，keep_mask 默认为 False，会被剔除
-                pass
+    def _compute_descriptors(self, image, features_np):
+        """
+        计算特征点的描述子
+        """
+        # 注意: 传入 orb.compute 的点必须是 KeyPoint 对象
+        pts_flat = features_np.reshape(-1, 2)
 
-        return keep_mask, occupancy_mask
+        # TODO:这里OV2SLAM里似乎没有指定size
+        kps = [cv2.KeyPoint(x=float(p[0]), y=float(p[1]), _size=31.0) for p in pts_flat]
+        kps_computed, descs = self.orb.compute(image, kps)
 
-    def _add_new_features_to_frame(self, frame, new_features):
-        """辅助函数：批量添加新特征"""
+        if descs is None: return np.empty((0, 32), dtype=np.uint8), np.zeros(len(features_np), dtype=bool)
+        
+        # 简单对齐：假设顺序没变 (通常 compute 不会乱序，只会剔除)
+        # 更严谨的做法是用坐标匹配，参考上一条回答
+        valid_mask = np.zeros(len(features_np), dtype=bool)
+        if len(kps_computed) == len(features_np):
+             valid_mask[:] = True
+        else:           
+            # 将 computed 坐标转为 numpy 数组，方便广播计算
+            computed_coords = np.array([kp.pt for kp in kps_computed], dtype=np.float32) # (M, 2)
+            
+            # 这里可能会稍微慢一点点，但是绝对准确 (O(N^2) 对于 N=250 来说是可以忽略的)
+            # 遍历所有输入点
+            for i, input_pt in enumerate(pts_flat):
+                # 寻找 computed 中是否有距离极近的点 (< 0.01 像素)
+                # 计算输入点到所有 computed 点的距离
+                dists = np.linalg.norm(computed_coords - input_pt, axis=1)
+                if np.min(dists) < 0.01: # 允许 0.01 像素的误差
+                    valid_mask[i] = True
+                    
+        return descs, valid_mask
+
+    def _add_new_features_to_frame(self, frame, new_features, new_descriptors):
+        """辅助函数：批量添加新特征 (带描述子)"""
         num_new = len(new_features)
         new_ids = np.arange(self.next_feature_id, self.next_feature_id + num_new)
         self.next_feature_id += num_new
@@ -106,7 +238,8 @@ class FeatureExtractor:
         # 新特征点初始 age 为 1
         new_ages = np.ones(num_new, dtype=int)
         
-        frame.add_visual_features(new_features, new_ids, new_ages)
+        # 传入描述子
+        frame.add_visual_features(new_features, new_ids, new_ages, new_descriptors)
 
     def reset(self):
         """

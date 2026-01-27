@@ -6,6 +6,7 @@ from utils.geometry import MultiViewGeometry
 from utils.visualization import visualize_optical_flow_tracking, visualize_epipolar_filtered_tracking
 from datatype.mappoint import MapPointStatus
 from utils.debug import Debugger
+import math
 
 # 运动模型
 class MotionModel:
@@ -75,6 +76,14 @@ class VisualFrontend:
         self.nbhtiles = self.cur_frame.camera.img_h / tile_size
         self.clahe = cv2.createCLAHE(clipLimit=config['clahe_value'], tileGridSize=(int(self.nbwtiles), int(self.nbhtiles)))
 
+        # 最大提取特征点
+        self.grid_cell_size = config.get('grid_cell_size', 35)
+        width = self.config.get('image_width', 752)
+        height = self.config.get('image_height', 480)
+        n_w_cells = math.ceil(width / self.grid_cell_size)
+        n_h_cells = math.ceil(height / self.grid_cell_size)
+        self.max_kps = int(n_w_cells * n_h_cells)
+
         # 预处理的灰度图
         self.prev_gray = None
 
@@ -89,6 +98,7 @@ class VisualFrontend:
         self.tracking_tracked_pts = None
         self.tracking_final_status = None
         self.tracking_kp_ids = None  # 保存特征点ID用于内点映射
+        self.tracking_is_3d = None  # 保存3D/2D追踪标记
 
         # 日志
         log_columns = [
@@ -171,6 +181,7 @@ class VisualFrontend:
             assert False, "[VisualFrontend] [Error]: Previous frame should not be None"
         
         T_wc_pred = self.motion_model.apply_motion_model(T_wc_prev, timestamp)
+        # T_wc_pred = T_wc_prev
         self.cur_frame.set_T_w_c(T_wc_pred)
 
         # 追踪新帧
@@ -243,7 +254,8 @@ class VisualFrontend:
             flat_kp = kp_px.flatten() # (1, 2) -> (2,)
             if map_point is not None and map_point.status == MapPointStatus.TRIANGULATED:
                 # 投影: World -> Image (Distorted) 这里的 T_cw是基于恒速模型预测的位姿
-                proj_px = self.cur_frame.camera.project_world_to_image(self.cur_frame.get_T_w_c(), map_point.get_point())
+                # 这里需要使用畸变投影，以适配未校正畸变的图像
+                proj_px = self.cur_frame.camera.project_world_to_image_dist(self.cur_frame.get_T_w_c(), map_point.get_point())
 
                 # 检查投影点是否在图像内（深度有可能为负，或者超出图像范围）
                 if self.cur_frame.camera.is_in_image(proj_px):
@@ -275,6 +287,7 @@ class VisualFrontend:
         all_tracked_pts = []
         all_final_status = []
         all_kp_ids = []  # 保存特征点ID用于后续内点映射
+        all_is_3d = []  # 标记哪些点是3D追踪（True）还是2D追踪（False）
         nb_good_3d = 0 # 跟踪到的 3D 点数量
         
         if len(valid_3d_kp_ids) > 0:
@@ -296,6 +309,7 @@ class VisualFrontend:
             all_tracked_pts.extend(tracked_pts)
             all_final_status.extend(status)
             all_kp_ids.extend(valid_3d_kp_ids)
+            all_is_3d.extend([True] * len(valid_3d_kps_px))  # 标记为3D追踪
 
             # 处理跟踪结果
             tracked_3d_list = []
@@ -324,7 +338,8 @@ class VisualFrontend:
                 self.cur_frame.add_visual_features(
                     np.array(tracked_3d_list), 
                     np.array(ids_3d_list), 
-                    np.array(ages_3d_list)
+                    np.array(ages_3d_list),
+                    descriptors=None
                 )
 
             print(f"[VisualFrontend KLT Tracking] Tracked {nb_good_3d} / {len(valid_3d_kps_px)} 3D points")
@@ -356,6 +371,7 @@ class VisualFrontend:
             all_tracked_pts.extend(tracked_pts)
             all_final_status.extend(status)
             all_kp_ids.extend(valid_2d_kp_ids)
+            all_is_3d.extend([False] * len(np_2d_kps))  # 标记为2D追踪
 
             tracked_2d_list = []
             ids_2d_list = []
@@ -372,14 +388,15 @@ class VisualFrontend:
                     ages_2d_list.append(update_age)
                     nb_good_2d += 1
                 else:
-                    # 不添加跟踪失败点的的位置/id/age
+                    # 不添加跟踪失败点的位置/id/age
                     continue
             
             if tracked_2d_list:
                 self.cur_frame.add_visual_features(
                     np.array(tracked_2d_list), 
                     np.array(ids_2d_list), 
-                    np.array(ages_2d_list)
+                    np.array(ages_2d_list),
+                    descriptors=None
                 )
 
             print(f"[VisualFrontend KLT Tracking] no prior: {nb_good_2d} / {len(valid_2d_kps_px)} points.")
@@ -395,10 +412,12 @@ class VisualFrontend:
             # 转换为BGR图像用于可视化
             curr_image_bgr = cv2.cvtColor(curr_gray, cv2.COLOR_GRAY2BGR) if len(curr_gray.shape) == 2 else curr_gray
             
+            all_is_3d_array = np.array(all_is_3d, dtype=bool)
             vis_img = visualize_optical_flow_tracking(
                 curr_image_bgr,
                 all_prev_pts, all_tracked_pts, all_final_status,
                 inliers_mask=None,
+                is_3d_mask=all_is_3d_array,
                 window_name="KLT Tracking (Before Epipolar Filtering)",
                 show_stats=True,
                 frame_id=self.cur_frame.get_id(),
@@ -412,6 +431,7 @@ class VisualFrontend:
             self.tracking_tracked_pts = all_tracked_pts
             self.tracking_final_status = all_final_status
             self.tracking_kp_ids = all_kp_ids  # 保存ID用于内点映射
+            self.tracking_is_3d = all_is_3d_array  # 保存3D/2D标记
         
         return nb_good_3d
     
@@ -493,7 +513,7 @@ class VisualFrontend:
 
         do_optimize = False
         # 单目情况下使用运动优化，在追踪情况差的时候使用
-        if (len(self.map_manager.active_keyframes) > 2 and n_tracked_valid_3d < 30):
+        if (len(self.map_manager.keyframes) > 2 and n_tracked_valid_3d < 30):
             print(f"[VisualFrontEnd Epipolar Filtering] Using motion optimization for pose recovery n_tracked_valid_3d: {n_tracked_valid_3d}")
             do_optimize = True
 
@@ -536,16 +556,16 @@ class VisualFrontend:
             return
 
         # 剔除 Outliers - 批量删除，避免循环中多次重建索引
+        ids_to_remove = []
+        ids_to_remove_3d = []
         if len(outliers_idx) > 0:
             all_outlier_ids = np.array(valid_kps_ids)[outliers_idx]
-            ids_to_remove = []
-            ids_to_remove_3d = []
             
-            # TODO：这里可能要删除已三角化的外点，先记录
+            # 记录已三角化的外点，进行无效观测剔除
             for kp_id in all_outlier_ids:
                 map_point = self.map_manager.get_map_point(kp_id)
                 if map_point is not None and map_point.status == MapPointStatus.TRIANGULATED:
-                    # ids_to_remove.append(kp_id)
+                    ids_to_remove.append(kp_id)
                     ids_to_remove_3d.append(kp_id)
                     continue
                 else:
@@ -590,6 +610,7 @@ class VisualFrontend:
                 curr_image_bgr,
                 self.tracking_prev_pts, self.tracking_tracked_pts, self.tracking_final_status,
                 inliers_mask=inliers_mask,
+                is_3d_mask=self.tracking_is_3d,
                 window_name="KLT Tracking (After Epipolar Filtering)",
                 show_stats=True,
                 frame_id=self.cur_frame.get_id(),
@@ -597,11 +618,12 @@ class VisualFrontend:
             )
             cv2.imshow("KLT Tracking (With Inliers)", vis_img)
             
-            # 显示对极约束过滤后的纯净追踪图像（只显示内点，绿色箭头）
+            # 显示对极约束过滤后的纯净追踪图像（只显示内点，区分3D/2D颜色）
             vis_img_clean = visualize_epipolar_filtered_tracking(
                 curr_image_bgr,
                 self.tracking_prev_pts, self.tracking_tracked_pts, self.tracking_final_status,
                 inliers_mask=inliers_mask,
+                is_3d_mask=self.tracking_is_3d,
                 window_name="Epipolar Filtered Tracking (Inliers Only)",
                 show_stats=True,
                 frame_id=self.cur_frame.get_id(),
@@ -612,7 +634,7 @@ class VisualFrontend:
 
         # TODO：单目模式下的位姿恢复（这里可以直接考虑替换VGGT）
         # 如果是单目且跟踪点少，尝试用 E 分解出的 R, t 替换当前位姿
-        if(do_optimize and len(self.map_manager.active_keyframes) > 2):
+        if(do_optimize and len(self.map_manager.keyframes) > 2):
             T_ref_w = ref_kf.get_T_c_w()
             T_w_cur = self.cur_frame.get_T_w_c()
             T_ref_cur = T_ref_w @ T_w_cur
@@ -851,8 +873,7 @@ class VisualFrontend:
         print(f"[VisualFrontEnd Compute Pose] Current predicted pose: {T_wc}")
         
         # 2. P3P RANSAC (如果需要，追踪3d点较少，追踪质量较差时使用)
-        # TODO: 暂时设为True，应该为self.do_p3p
-        if True:
+        if self.do_p3p:
             print(f"[VisualFrontEnd Compute Pose] Running P3P RANSAC on {len(np_bvs)} points...")
 
             success, p3p_pose, outliers_idx = MultiViewGeometry.p3p_ransac(
@@ -956,8 +977,8 @@ class VisualFrontend:
         # nb3dkps: 当前帧跟踪到的 3D 点数量
         # nbmaxkps: 最大特征点数配置
         nb_3d_kps = n_tracked_valid_3d
-        visual_features_num = len(self.cur_frame.get_visual_feature_ids()) 
-        n_max_kps = self.config['max_features_to_detect']
+        n_occupied_cells = self.cur_frame.get_n_occupied_cells()
+        visual_features_num = len(self.cur_frame.get_visual_feature_ids())
         
         # TODO: 暂时设为 False，后续对接后端时替换
         is_local_ba_running = False
@@ -978,10 +999,10 @@ class VisualFrontend:
         # 条件 1: 跟踪极差 (特征点覆盖率极低)
         # ---------------------------------------------------------------------
         # 覆盖率 < 33% 且距离上一 KF 超过 5 帧 且 后端空闲
-        if (visual_features_num < 0.33 * n_max_kps and 
+        if (n_occupied_cells < 0.33 * self.max_kps and 
             n_frames_since_kf >= 5 and 
             not is_local_ba_running):
-            print(f"[VisualFrontEnd Check New Keyframe] Low occupancy ({visual_features_num}), inserting KF.")
+            print(f"[VisualFrontEnd Check New Keyframe] Low occupancy ({n_occupied_cells}), inserting KF.")
             return True
 
         # ---------------------------------------------------------------------
@@ -996,7 +1017,7 @@ class VisualFrontend:
         # ---------------------------------------------------------------------
         # 抑制条件: 如果 3D 点充足，且 (后端忙 OR 间隔太短)，则不插
         # ---------------------------------------------------------------------
-        if (nb_3d_kps > 0.5 * n_max_kps and 
+        if (nb_3d_kps > 0.5 * self.max_kps and 
             (is_local_ba_running or n_frames_since_kf < 2)):
             return False
 
@@ -1018,7 +1039,7 @@ class VisualFrontend:
         c1 = nb_3d_kps < 0.75 * n_ref_3d
         
         # c2: 覆盖率和 3D 点数都下降，且后端空闲
-        c2 = (visual_features_num < 0.5 * n_max_kps and 
+        c2 = (n_occupied_cells < 0.5 * self.max_kps and 
               nb_3d_kps < 0.85 * n_ref_3d and 
               not is_local_ba_running)
 
@@ -1031,6 +1052,7 @@ class VisualFrontend:
         self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_is_kf_required", kf_flag)
         self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_med_rot_parallax", med_rot_parallax)
         self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_n_frames_since_kf", n_frames_since_kf)
+        self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_n_occupied_cells", n_occupied_cells)
         self.logger.log_flexible(self.cur_frame.timestamp, "check_new_keyframe_n_visual_features_num", visual_features_num)
 
         if is_kf_required:

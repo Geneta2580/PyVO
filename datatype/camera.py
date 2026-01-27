@@ -98,6 +98,13 @@ class CameraCalibration:
         if w > 0 and h > 0:
             self.roi_mask[y:y+h, x:x+w] = 255
 
+    def project_world_to_cam(self, T_wc, pt_3d_w):
+        T_cw = np.linalg.inv(T_wc)
+        pt_3d_w_hom = np.append(pt_3d_w, 1.0)
+        pt_3d_c_hom = T_cw @ pt_3d_w_hom
+        pt_3d_c = pt_3d_c_hom[:3]
+        return pt_3d_c
+
     def project_world_to_image(self, T_wc, pt_3d_w):
         T_cw = np.linalg.inv(T_wc)
 
@@ -111,6 +118,24 @@ class CameraCalibration:
             return None
         
         pt_2d = self.project_cam_to_image(pt_3d_c)
+        return pt_2d
+
+    def project_world_to_image_dist(self, T_wc, pt_3d_w):
+        """
+        将世界坐标点投影到原始(畸变)图像平面
+        """
+        T_cw = np.linalg.inv(T_wc)
+
+        pt_3d_w_hom = np.append(pt_3d_w, 1.0)
+        pt_3d_c_hom = T_cw @ pt_3d_w_hom
+        pt_3d_c = pt_3d_c_hom[:3]
+
+        # 检查深度
+        if pt_3d_c[2] <= 0:
+            print(f"[Camera] project_world_to_image_dist: Depth is negative")
+            return None
+
+        pt_2d = self.project_cam_to_image_dist(pt_3d_c)
         return pt_2d
 
     def project_cam_to_image(self, pt_3d):

@@ -1,5 +1,6 @@
+from os import curdir
 import numpy as np
-from datatype import mappoint
+import math
 from datatype.mappoint import MapPointStatus
 from utils.geometry import MultiViewGeometry
 
@@ -9,6 +10,21 @@ class Mapper:
         self.map_manager = map_manager
         self.prev_keyframe = None
         self.cur_keyframe = None
+
+        # 共视点匹配参数
+        self.max_proj_dist = config.get('max_proj_dist', 10.0) # 最大投影距离
+        self.max_desc_dist = config.get('max_desc_dist', 10.0) # 最大描述子距离
+
+        # 局部地图点数量限制
+        self.grid_cell_size = config.get('grid_cell_size', 35)
+        width = self.config.get('image_width', 752)
+        height = self.config.get('image_height', 480)
+        n_w_cells = math.ceil(width / self.grid_cell_size)
+        n_h_cells = math.ceil(height / self.grid_cell_size)
+        self.max_kps = int(n_w_cells * n_h_cells)
+
+        # 最大允许汉明距离阈值（如果两个特征点的差异超过了总位数的 X%则说明两者不是同一个点）
+        self.dist_ratio = config.get('dist_ratio', 0.2) 
 
     def triangulate(self, keyframe):
         """
@@ -150,7 +166,7 @@ class Mapper:
             return False
         
         # 1. 统计已三角化的地图点数量
-        triangulated_mappoints = self.map_manager.get_active_mappoints()
+        triangulated_mappoints = self.map_manager.get_triangulated_mappoints()
         num_triangulated = len(triangulated_mappoints)
         
         print(f"[Mapper] Checking initialization quality: {num_triangulated} triangulated mappoints")
@@ -161,12 +177,12 @@ class Mapper:
             return True
         
         # 2. 统计前10个关键帧的3D点数量
-        active_keyframes = self.map_manager.get_active_keyframes()
-        if len(active_keyframes) == 0:
+        keyframes = self.map_manager.get_keyframes()
+        if len(keyframes) == 0:
             return False
         
         # 获取前10个关键帧（按ID排序）
-        first_10_keyframes = sorted(active_keyframes, key=lambda kf: kf.get_id())[:10]
+        first_10_keyframes = sorted(keyframes, key=lambda kf: kf.get_id())[:10]
         
         # 统计这10个关键帧中观测到的唯一已三角化地图点数量
         unique_3d_mappoints = set()
@@ -189,8 +205,286 @@ class Mapper:
         print(f"[Mapper] Initialization quality check passed: {num_triangulated} mappoints, {total_3d_points} 3D points in first 10 KFs")
         return False
 
-    def map(self, keyframe):
-        pass
+    def match_to_local_map(self, frame):
+        """
+        [后端核心] 将局部地图点投影到当前帧，进行匹配和融合。
+        """
+        print(f"[Mapper] Refining matches for KF {frame.get_id()}...")
+
+        # 1. 准备候选点集合
+        max_local_mps = self.max_kps * 10
+        candidate_mp_ids = frame.get_local_map_ids() # 这是一个 set
+
+        # =========================================================
+        # Part A: 候选点扩充 (Fallback Expansion)
+        # 如果 candidate_mp_ids 数量不够，去共视图里再挖一挖
+        # =========================================================
+        if len(candidate_mp_ids) < max_local_mps:
+            print(f"[Mapper] Candidate mappoints size: {len(candidate_mp_ids)} < {max_local_mps}, expanding from covisible map")
+            with self.map_manager.map_lock:
+                # 获取共视图
+                cov_map = frame.get_covisible_map() # {kf_id: weight}
+
+                # 获取最老的共视帧 ID (ID 最小)
+                oldest_cov_kf_id = -1
+                if len(cov_map) > 0:
+                    # min(keys) 获取最小 ID
+                    oldest_cov_kf_id = min(cov_map.keys())
+                else:
+                    # 如果没有共视帧(极端情况)，尝试回溯上一帧 ID
+                    if frame.get_id() > 0:
+                        oldest_cov_kf_id = frame.get_id() - 1
+                
+                # 时间回溯兜底 (kfid--)
+                search_id = oldest_cov_kf_id
+                target_kf = None
+                
+                # 尝试往回找，最多找比如 5 帧，或者一直找到 0
+                while search_id >= 0:
+                    target_kf = self.map_manager.get_keyframe(search_id)
+                    if target_kf is not None:
+                        break # 找到了
+                    
+                    search_id -= 1
+
+                if target_kf is not None:
+                    # 获取共视KF看到的点
+                    inherited_ids = target_kf.get_local_map_ids()
+                    if len(inherited_ids) == 0:
+                         inherited_ids = target_kf.get_visual_feature_ids()
+
+                    # 补充进候选集
+                    for feature_id in inherited_ids:
+                        # 只有当：1.有效 2.未被当前KF观测 3.不在集合中 时才添加
+                        if (feature_id not in candidate_mp_ids) and (not frame.is_observing_feature(feature_id)):
+                            mp = self.map_manager.get_map_point(feature_id)
+                            # 只引入已经三角化稳定的点
+                            if mp and mp.status == MapPointStatus.TRIANGULATED: 
+                                candidate_mp_ids.add(feature_id)
+
+        print(f"[Mapper] Search candidates size: {len(candidate_mp_ids)}")
+        if len(candidate_mp_ids) == 0:
+            return False
+
+        # =========================================================
+        # Part B: 投影及描述子匹配 (Projection & Descriptor Matching)
+        # =========================================================
+        # 输出[当前KF特征点，历史局部地图3d地图点]
+        matches_found = self.match_to_map(frame, candidate_mp_ids)
+        num_matches = len(matches_found)
+
+        print(f"[Mapper] Match To Local Map found #{num_matches} matches")
+
+        if num_matches == 0:
+            return False
+
+        # =========================================================
+        # Part C: 融合与更新 (Merging)
+        # =========================================================
+        count_merged = 0
+
+        # 将 matches_found 转换为 {prev_id: new_id} 的形式，方便处理
+        # map_previd_newid 对应 C++ mergeMatches 的入参 map_kpids_lmids
+        map_previd_newid = {}
+        for feat_idx, new_lmid in matches_found.items():
+            # 当前特征点原本的ID
+            prev_lmid = frame.visual_feature_ids[feat_idx]
+            
+            # 只有当 ID 确实不同时才需要合并
+            if prev_lmid != new_lmid:
+                map_previd_newid[prev_lmid] = new_lmid
+
+        with self.map_manager.map_lock:
+            for prev_lmid, new_lmid in map_previd_newid.items():
+                self.map_manager.merge_mappoints(prev_lmid, new_lmid, current_frame=frame)
+                count_merged += 1
+
+        print(f"[Mapper] Refinement result: Merged {count_merged} ghosts.")
+
+    def match_to_map(self, frame, candidate_mp_ids):
+        map_previd_newid = {} # 最终结果 {feature_id_in_frame: matched_local_mp_id}
+        
+        # 计算最大视场角
+        vfov_tan = 0.5 * frame.camera.img_h / frame.camera.fy
+        hfov_tan = 0.5 * frame.camera.img_w / frame.camera.fx
+
+        max_tan_fov = max(hfov_tan, vfov_tan)
+        max_rad_fov = np.arctan(max_tan_fov)
+
+        view_th = np.cos(max_rad_fov)
+        
+        # 统计当前帧中已有的 3D 地图点数量
+        n_tracked_3d = 0
+        current_feature_ids = frame.get_visual_feature_ids()
+        for fid in current_feature_ids:
+            mp = self.map_manager.get_map_point(fid)
+            if mp is not None and mp.status == MapPointStatus.TRIANGULATED:
+                n_tracked_3d += 1
+
+        # 动态调整搜索半径
+        max_proj_dist = self.max_proj_dist
+        if(n_tracked_3d < 30):
+            max_proj_dist = self.max_proj_dist * 2
+
+        map_kpids_near_dist = {} # {feat_idx: [(mp_id, dist)]}
+
+        # 遍历候选局部地图3d点（当前KF未观测到的部分）
+        for mp_id in candidate_mp_ids:
+            # ---------------------------------------------------------
+            # 检查候选局部3d点是否有效
+            # ---------------------------------------------------------
+            # 如果当前帧已经观测到了该点，则跳过
+            if frame.is_observing_feature(mp_id):
+                continue
+
+            mp = self.map_manager.get_map_point(mp_id)
+            if mp is None:
+                continue
+            
+            if mp.status != MapPointStatus.TRIANGULATED and mp.descriptors is None:
+                continue
+
+            mp_pos = mp.get_point()
+            proj_cam = frame.camera.project_world_to_cam(frame.get_T_w_c(), mp_pos)
+            # 检查投影深度
+            if proj_cam[2] < 0.1:
+                continue
+
+            # 检查视场角
+            view_angle = proj_cam[2] / np.linalg.norm(proj_cam)
+            if np.abs(view_angle) < view_th:
+                continue
+
+            # 检查畸变投影是否在图像内
+            proj_img = frame.camera.project_cam_to_image_dist(proj_cam)
+            if not frame.camera.is_in_image(proj_img):
+                continue
+            
+            # 获取邻近投影点的特征点（作为和历史特征点匹配的候选）
+            vnear_indices = frame.get_features_in_area(proj_img[0], proj_img[1])
+
+            # ---------------------------------------------------------
+            # 4. 遍历候选特征点 (Inner Loop: C++ for(const auto &kp : vnearkps))
+            # ---------------------------------------------------------
+            # 准备匹配变量
+            min_dist = 32 * self.dist_ratio * 8.0 # 字节转比特（ORB描述子32个字节，256比特）
+            best_id = -1
+            sec_id = -1
+            best_dist = min_dist
+            sec_dist = min_dist
+
+            for idx in vnear_indices:
+                kp_id = frame.visual_feature_ids[idx]
+                kp_px = frame.visual_features[idx].flatten()
+                if kp_id < 0: continue
+
+                # --- A. 像素距离检查 (Pixel Distance Check) ---
+                px_dist = np.linalg.norm(proj_img - kp_px)
+                if px_dist > max_proj_dist: continue
+            
+                # --- B. 数据关联严格检查 (Co-visibility Check) ---
+                # 这里的near_mp是CANDIDATE或TRIANGULATED
+                near_mp = self.map_manager.get_map_point(kp_id)
+
+                if near_mp is None: 
+                    self.map_manager.remove_observation_both_sides(kp_id, frame.get_id())
+                    continue
+
+                if near_mp.descriptors is None:
+                    continue
+
+                is_candidate = True
+
+                # 这里相当于已知一个局部地图候选3d点，需要查找其在当前帧的匹配观测
+                # 现在相当于找到了配对的可疑人员near_mp，但是他和原始输入查询对象mp不能同时被同一个KF观测到，否则就是两个点
+                candidate_obs_kfs = set(mp.get_observing_kf_ids()) # 当前选中局部候选点的所有观测
+                near_obs_kfs = near_mp.get_observing_kf_ids() # 当前KF潜在匹配点的所有观测
+                
+                # 这里当前候选（当前KF潜在的匹配点）不能和查询的（局部地图的mp）路标点同时在
+                # 同一个KF上，这样说明两者物理上就不是一个点（这里的目标是合并匹配观测和局部地图点）
+                for kf_id in candidate_obs_kfs:
+                    if kf_id in near_obs_kfs:
+                        is_candidate = False
+                        break
+
+                if not is_candidate: continue
+
+                # --- C. 重投影一致性检查 (Co-projection Check) ---
+                reproj_error = 0.0
+                nb_co_kp = 0
+
+                # 遍历可疑人员的所有观测KF，检查查询mp在这些KF上的重投影一致性（如果一致，说明可能是同一个点）
+                for kf_id in near_obs_kfs:
+                    co_kf = self.map_manager.get_keyframe(kf_id)
+                    if co_kf is None: 
+                        self.map_manager.remove_observation_both_sides(kp_id, kf_id)
+                        print(f"[Mapper] KF {kf_id} not found for mappoint {kp_id}")
+                        continue
+                    
+                    # 获取当前KF上潜在匹配对象在其所有观测KF上的所有2d像素观测坐标
+                    co_kp_px = co_kf.get_feature_position(kp_id)
+                    if co_kp_px is not None:
+                        # 将局部地图点投影到像素匹配潜在KF的像素平面
+                        T_w_c_near_kf = co_kf.get_T_w_c()
+                        proj_candidate_in_near_kf = co_kf.camera.project_world_to_image_dist(T_w_c_near_kf, mp_pos)
+                        if proj_candidate_in_near_kf is not None:
+                            reproj_error += np.linalg.norm(co_kp_px - proj_candidate_in_near_kf)
+                            nb_co_kp += 1
+                    else:
+                        self.map_manager.remove_observation_both_sides(kp_id, kf_id)
+                        print(f"[Mapper] Co-KP {kp_id} not found for mappoint {mp_id}")
+                        continue
+                
+                avg_reproj_error = reproj_error / nb_co_kp
+                if (avg_reproj_error > max_proj_dist):
+                    continue
+
+                # --- D. 描述子匹配 ---
+                dist = mp.compute_min_desc_dist(near_mp)
+
+                if dist <= best_dist:
+                    sec_dist = best_dist
+                    sec_id = best_id
+                    best_dist = dist
+                    best_id = kp_id
+                elif dist <= sec_dist:
+                    sec_dist = dist
+                    sec_id = kp_id
+
+            # ---------------------------------------------------------
+            # 5. 记录结果 
+            # ---------------------------------------------------------
+            # 最优匹配和次优匹配靠的太近，说明匹配失败（结果不唯一），直接舍弃
+            if best_id != -1 and sec_id != -1:
+                if 0.9 * sec_dist < best_dist:
+                    best_id = -1
+            
+            if best_id < 0: continue
+
+            # 将匹配结果存入暂存区，用于解决多对一冲突
+            # 这里实际上是输入一个局部地图的3d候选点，输出一个当前帧的潜在匹配点
+            # 但是这个查询是单向的，当前多个局部地图的3d候选点可能都声称同一个当前KF特征点与其匹配，因此需要解决多对一冲突
+            if best_id not in map_kpids_near_dist:
+                map_kpids_near_dist[best_id] = []
+            map_kpids_near_dist[best_id].append((mp_id, best_dist))
+
+        # ---------------------------------------------------------
+        # 6. 解决多对一冲突 (Multi-to-One Conflict Resolution
+        # ---------------------------------------------------------
+        # 遍历一个当前匹配特征点可能的多个局部3d地图候选点，选择描述子距离最小的那个
+        for kp_id, mp_list in map_kpids_near_dist.items():
+            best_mp_id = -1
+            min_dist = 1024.0
+
+            for mp_id, dist in mp_list:
+                if dist < min_dist:
+                    min_dist = dist
+                    best_mp_id = mp_id
+            
+            if best_mp_id >= 0:
+                map_previd_newid[kp_id] = best_mp_id
+        
+        return map_previd_newid
 
     def reset(self):
         """

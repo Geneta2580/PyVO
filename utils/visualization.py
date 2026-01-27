@@ -46,6 +46,7 @@ def visualize_optical_flow_tracking(
     tracked_pts, 
     final_status,
     inliers_mask=None,
+    is_3d_mask=None,
     window_name="Optical Flow Tracking",
     show_stats=True,
     frame_id=None,
@@ -60,6 +61,7 @@ def visualize_optical_flow_tracking(
         tracked_pts: 追踪后的特征点坐标 (N, 2) 或 (N, 1, 2)
         final_status: 追踪状态布尔数组 (N,)，True表示追踪成功
         inliers_mask: 内点掩码 (N,)，True表示经过对极约束过滤后的内点，可选
+        is_3d_mask: 3D/2D追踪标记 (N,)，True表示3D先验追踪，False表示2D无先验追踪，可选
         window_name: 窗口名称
         show_stats: 是否在图像上显示统计信息
         frame_id: 当前帧ID，可选
@@ -92,12 +94,16 @@ def visualize_optical_flow_tracking(
         final_status = final_status[:min_len]
         if inliers_mask is not None:
             inliers_mask = inliers_mask[:min_len]
+        if is_3d_mask is not None:
+            is_3d_mask = is_3d_mask[:min_len]
     
     if len(final_status) != len(prev_pts):
         print(f"[Visualization] Warning: Status length mismatch, truncating to match points")
         final_status = final_status[:len(prev_pts)]
         if inliers_mask is not None and len(inliers_mask) != len(prev_pts):
             inliers_mask = inliers_mask[:len(prev_pts)]
+        if is_3d_mask is not None and len(is_3d_mask) != len(prev_pts):
+            is_3d_mask = is_3d_mask[:len(prev_pts)]
     
     # 转换为整数坐标用于绘制
     prev_pts_int = prev_pts.astype(np.int32)
@@ -125,13 +131,38 @@ def visualize_optical_flow_tracking(
     tracked_failed = total_points - tracked_success
     success_ratio = tracked_success / total_points if total_points > 0 else 0.0
     
+    # 3D/2D追踪统计
+    if is_3d_mask is not None:
+        n_3d_total = np.sum(is_3d_mask)
+        n_2d_total = total_points - n_3d_total
+        n_3d_tracked = np.sum(is_3d_mask & final_status)
+        n_2d_tracked = np.sum(~is_3d_mask & final_status)
+        n_3d_ratio = n_3d_tracked / n_3d_total if n_3d_total > 0 else 0.0
+        n_2d_ratio = n_2d_tracked / n_2d_total if n_2d_total > 0 else 0.0
+    else:
+        n_3d_total = 0
+        n_2d_total = 0
+        n_3d_tracked = 0
+        n_2d_tracked = 0
+        n_3d_ratio = 0.0
+        n_2d_ratio = 0.0
+    
     # 内点统计
     if inliers_mask is not None:
         n_inliers = np.sum(inliers_mask & final_status)  # 既是追踪成功又是内点
         inlier_ratio = n_inliers / total_points if total_points > 0 else 0.0
+        # 3D/2D内点统计
+        if is_3d_mask is not None:
+            n_3d_inliers = np.sum(is_3d_mask & inliers_mask & final_status)
+            n_2d_inliers = np.sum(~is_3d_mask & inliers_mask & final_status)
+        else:
+            n_3d_inliers = 0
+            n_2d_inliers = 0
     else:
         n_inliers = tracked_success  # 如果没有提供内点信息，假设所有追踪成功的都是内点
         inlier_ratio = success_ratio
+        n_3d_inliers = 0
+        n_2d_inliers = 0
     
     # 在当前帧图像上绘制特征点和箭头
     for i in range(total_points):
@@ -140,20 +171,38 @@ def visualize_optical_flow_tracking(
         tracked_pt_vis = (tracked_pts_vis[i][0] + stats_panel_width, tracked_pts_vis[i][1])
         
         if final_status[i]:
-            # 追踪成功的点：根据是否为内点选择颜色
-            if inliers_mask is not None and inliers_mask[i]:
-                # 内点：绿色
-                color = (0, 255, 0)
-                thickness = 2
-            else:
-                # 追踪成功但不是内点（如果提供了内点信息）：黄色
-                if inliers_mask is not None:
-                    color = (0, 255, 255)
-                    thickness = 1
+            # 追踪成功的点：根据3D/2D追踪和内点状态选择颜色
+            is_3d = is_3d_mask[i] if is_3d_mask is not None else None
+            is_inlier = inliers_mask[i] if inliers_mask is not None else None
+            
+            # 优先根据3D/2D追踪类型选择颜色
+            # 注意：OpenCV使用BGR格式，不是RGB
+            if is_3d is not None:
+                if is_3d:
+                    # 3D先验追踪：蓝色 (BGR格式)
+                    base_color = (255, 0, 0)  # BGR格式：蓝色
                 else:
-                    # 没有内点信息，所有追踪成功的都显示为绿色
-                    color = (0, 255, 0)
+                    # 2D无先验追踪：绿色 (BGR格式)
+                    base_color = (0, 255, 0)  # BGR格式：绿色
+            else:
+                # 没有3D/2D标记信息，使用默认颜色
+                base_color = (0, 255, 0)  # BGR格式：绿色
+            
+            # 根据内点状态调整颜色和粗细
+            if inliers_mask is not None:
+                if is_inlier:
+                    # 内点：使用基础颜色，较粗
+                    color = base_color
                     thickness = 2
+                else:
+                    # 追踪成功但不是内点：使用较淡的颜色，较细
+                    # 将颜色调淡（混合白色）
+                    color = tuple(int(c * 0.5 + 128 * 0.5) for c in base_color)
+                    thickness = 1
+            else:
+                # 没有内点信息，使用基础颜色
+                color = base_color
+                thickness = 2
             
             # 在当前帧图像上绘制上一帧特征点（箭头起点）
             cv2.circle(vis_image, prev_pt_vis, 3, color, -1)
@@ -208,9 +257,31 @@ def visualize_optical_flow_tracking(
             f"Success Rate: {success_ratio*100:.1f}%",
             f"Tracked Failed: {tracked_failed}",
             "",
+        ])
+        
+        # 添加3D/2D追踪统计
+        if is_3d_mask is not None and (n_3d_total > 0 or n_2d_total > 0):
+            stats_text.extend([
+                "--- 3D/2D Tracking ---",
+                f"3D (Blue): {n_3d_tracked}/{n_3d_total} ({n_3d_ratio*100:.1f}%)",
+                f"2D (Green): {n_2d_tracked}/{n_2d_total} ({n_2d_ratio*100:.1f}%)",
+                "",
+            ])
+        
+        # 添加内点统计
+        stats_text.extend([
             f"Inliers: {n_inliers}",
             f"Inlier Rate: {inlier_ratio*100:.1f}%"
         ])
+        
+        # 添加3D/2D内点统计
+        if inliers_mask is not None and is_3d_mask is not None and (n_3d_inliers > 0 or n_2d_inliers > 0):
+            stats_text.extend([
+                "",
+                "--- Inliers by Type ---",
+                f"3D Inliers: {n_3d_inliers}",
+                f"2D Inliers: {n_2d_inliers}"
+            ])
         
         # 绘制统计信息文本
         for i, text in enumerate(stats_text):
@@ -269,6 +340,7 @@ def visualize_epipolar_filtered_tracking(
     tracked_pts,
     final_status,
     inliers_mask,
+    is_3d_mask=None,
     window_name="Epipolar Filtered Tracking (Inliers Only)",
     show_stats=True,
     frame_id=None,
@@ -278,8 +350,8 @@ def visualize_epipolar_filtered_tracking(
     可视化对极约束过滤后的纯净追踪图像（只显示内点）
     
     与 visualize_optical_flow_tracking 的区别：
-    - 只显示经过对极约束过滤后的内点（绿色箭头）
-    - 不显示追踪成功但不是内点的点（黄色箭头）
+    - 只显示经过对极约束过滤后的内点（根据3D/2D使用不同颜色）
+    - 不显示追踪成功但不是内点的点
     - 不显示追踪失败的点（红色点）
     
     Args:
@@ -288,6 +360,7 @@ def visualize_epipolar_filtered_tracking(
         tracked_pts: 追踪后的特征点坐标 (N, 2) 或 (N, 1, 2)
         final_status: 追踪状态布尔数组 (N,)，True表示追踪成功
         inliers_mask: 内点掩码 (N,)，True表示经过对极约束过滤后的内点，必须提供
+        is_3d_mask: 3D/2D追踪标记 (N,)，True表示3D先验追踪，False表示2D无先验追踪，可选
         window_name: 窗口名称
         show_stats: 是否在图像上显示统计信息
         frame_id: 当前帧ID，可选
@@ -323,11 +396,15 @@ def visualize_epipolar_filtered_tracking(
         tracked_pts = tracked_pts[:min_len]
         final_status = final_status[:min_len]
         inliers_mask = inliers_mask[:min_len]
+        if is_3d_mask is not None:
+            is_3d_mask = is_3d_mask[:min_len]
     
     if len(final_status) != len(prev_pts):
         print(f"[Visualization] Warning: Status length mismatch, truncating to match points")
         final_status = final_status[:len(prev_pts)]
         inliers_mask = inliers_mask[:len(prev_pts)]
+        if is_3d_mask is not None and len(is_3d_mask) != len(prev_pts):
+            is_3d_mask = is_3d_mask[:len(prev_pts)]
     
     # 转换为整数坐标用于绘制
     prev_pts_int = prev_pts.astype(np.int32)
@@ -356,6 +433,18 @@ def visualize_epipolar_filtered_tracking(
     n_inliers = np.sum(inliers_only)
     inlier_ratio = n_inliers / total_points if total_points > 0 else 0.0
     
+    # 3D/2D内点统计
+    if is_3d_mask is not None:
+        n_3d_inliers = np.sum(is_3d_mask & inliers_only)
+        n_2d_inliers = np.sum(~is_3d_mask & inliers_only)
+        n_3d_total = np.sum(is_3d_mask)
+        n_2d_total = total_points - n_3d_total
+    else:
+        n_3d_inliers = 0
+        n_2d_inliers = 0
+        n_3d_total = 0
+        n_2d_total = 0
+    
     # 在当前帧图像上绘制特征点和箭头（只绘制内点）
     for i in range(total_points):
         # 只绘制内点（追踪成功且是对极约束内点）
@@ -366,8 +455,18 @@ def visualize_epipolar_filtered_tracking(
         prev_pt_vis = (prev_pts_vis[i][0] + stats_panel_width, prev_pts_vis[i][1])
         tracked_pt_vis = (tracked_pts_vis[i][0] + stats_panel_width, tracked_pts_vis[i][1])
         
-        # 内点：绿色
-        color = (0, 255, 0)
+        # 根据3D/2D追踪类型选择颜色
+        # 注意：OpenCV使用BGR格式，不是RGB
+        if is_3d_mask is not None:
+            if is_3d_mask[i]:
+                # 3D先验追踪：蓝色 (BGR格式)
+                color = (255, 0, 0)  # BGR格式：蓝色
+            else:
+                # 2D无先验追踪：绿色 (BGR格式)
+                color = (0, 255, 0)  # BGR格式：绿色
+        else:
+            # 没有3D/2D标记信息，使用默认绿色
+            color = (0, 255, 0)  # BGR格式：绿色
         thickness = 2
         
         # 在当前帧图像上绘制上一帧特征点（箭头起点）
@@ -420,9 +519,21 @@ def visualize_epipolar_filtered_tracking(
             f"Inliers Only: {n_inliers}",
             f"Inlier Rate: {inlier_ratio*100:.1f}%",
             "",
+        ])
+        
+        # 添加3D/2D内点统计
+        if is_3d_mask is not None and (n_3d_inliers > 0 or n_2d_inliers > 0):
+            stats_text.extend([
+                "--- Inliers by Type ---",
+                f"3D (Blue): {n_3d_inliers}",
+                f"2D (Green): {n_2d_inliers}",
+                "",
+            ])
+        
+        stats_text.extend([
             "Note: Only showing",
             "epipolar inliers",
-            "(green arrows)"
+            "(colored by 3D/2D)"
         ])
         
         # 绘制统计信息文本

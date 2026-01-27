@@ -29,8 +29,11 @@ image_height: 376
 # 最大特征点数
 max_features_to_detect: 300
 
-# 特征点的最小距离
-min_dist: 35
+# 网格单元大小
+grid_cell_size: 30
+
+# 最大质量等级
+max_quality_level: 0.001
 
 # CLAHE参数
 use_clahe: True

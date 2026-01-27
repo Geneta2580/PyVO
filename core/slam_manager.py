@@ -28,7 +28,8 @@ class SLAMManager:
         
         # 初始化帧参数
         self.prev_frame = None
-        self.cur_frame = Frame(self.global_camera, 0, 0)
+        self.cur_frame = Frame(self.config, self.global_camera, 0, 0)
+        self.last_kf_id = None
 
         # 初始化局部地图
         self.map_manager = MapManager(self.config)
@@ -87,7 +88,7 @@ class SLAMManager:
             return
 
         # 创建新帧
-        new_frame = Frame(self.global_camera, self.frame_id, timestamp)
+        new_frame = Frame(self.config, self.global_camera, self.frame_id, timestamp)
         new_frame.image = image
         self.cur_frame = new_frame
         self.frame_id += 1
@@ -167,6 +168,7 @@ class SLAMManager:
     def _create_keyframe(self, curr_gray):
         # 普通帧变成关键帧时，设置 ref_kf_id 为自己的ID
         # 这样后续普通帧会绑定到这个新的关键帧
+        self.last_kf_id = self.cur_frame.ref_kf_id # 当前KF之前的最后一个KF ID
         self.cur_frame.ref_kf_id = self.cur_frame.get_id()
         
         # 在添加到 map_manager 之前，先补充提取特征点
@@ -177,16 +179,23 @@ class SLAMManager:
         self.map_manager.add_keyframe(self.cur_frame)
         print(f"[SLAMManager] Keyframe {self.cur_frame.get_id()} added to map_manager! ref_kf_id: {self.cur_frame.ref_kf_id}, features: {len(self.cur_frame.get_visual_feature_ids())}")
         
-        # 进行三角化
         if self.mapper is not None:
+            # 三角化，会将成功三角化的地图点设置为 TRIANGULATED 状态
             self.mapper.triangulate(self.cur_frame)
-            n_active_kfs = len(self.map_manager.active_keyframes)
+            n_keyframes = len(self.map_manager.keyframes)
 
-            if n_active_kfs > 3:
-                self.optimizer.optimize()
+            # 设置共视图，并双向更新共视图
+            self.map_manager.update_covisibility_graph(self.cur_frame, last_kf_id=self.last_kf_id)
+
+            # 局部地图匹配
+            self.mapper.match_to_local_map(self.cur_frame)
+
+            # BA优化
+            # if n_active_kfs > 3:
+            #     self.optimizer.optimize()
 
             # 检查初始化质量（初始化完成后(至少两帧，防止重置死循环)，第一个滑窗满之前，检查地图点数量）
-            if len(self.map_manager.global_keyframes) == 0 and n_active_kfs > 2:
+            if 2 < n_keyframes < 10:
                 if self.mapper.check_initialization_quality(self.visual_frontend.visual_init_ready):
                     # 初始化质量不足，重置系统
                     print(f"[SLAMManager] Initialization quality insufficient, resetting system...")

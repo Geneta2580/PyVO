@@ -17,8 +17,6 @@ class MapManager:
         T_bc_raw = self.config.get('T_bc', np.eye(4).flatten().tolist())
         self.T_bc = np.asarray(T_bc_raw).reshape(4, 4)
 
-        self.max_active_keyframes = self.config.get('window_size', 10)
-
         # 三角化参数
         self.triangulation_max_depth = self.config.get('triangulation_max_depth', 100)
         self.triangulation_min_depth = self.config.get('triangulation_min_depth', 0.1)
@@ -32,110 +30,29 @@ class MapManager:
         # 相机内参
         self.cam_intrinsics = np.asarray(self.config.get('cam_intrinsics')).reshape(3, 3)
 
-        # 1. 当前活跃窗口 (参与 Local BA)
-        self.active_keyframes = {}   # {kf_id: KeyFrame}
-        self.local_mappoints = {}    # {mp_id: MapPoint} - 窗口内可见的地图点
-
-        # 2. 历史/全局地图 (不参与 Local BA，用于回环或纯存储)
-        self.global_keyframes = {}   # {kf_id: KeyFrame}
-        self.global_mappoints = {}   # {mp_id: MapPoint}
+        self.keyframes = {}   # {kf_id: KeyFrame} - 存所有活着的关键帧
+        self.mappoints = {}   # {mp_id: MapPoint} - 存所有活着的地图点
 
     def add_keyframe(self, kf):
         """
         添加新关键帧进入滑动窗口，并处理路标点关联
         """
         with self.map_lock:
-            # 1. 加入活跃窗口
-            self.active_keyframes[kf.get_id()] = kf
-
-            # 2. 处理该帧观测到的特征点
-            # 遍历当前帧的所有特征点
+            # 1. 存入大地图
+            self.keyframes[kf.get_id()] = kf
+            
+            # 2. 处理地图点
             for mp_id, pt_2d in zip(kf.get_visual_feature_ids(), kf.get_visual_features()):
-                
-                # 情况 A: 这是一个已知的活跃地图点
-                if mp_id in self.local_mappoints:
-                    mp = self.local_mappoints[mp_id]
+                if mp_id in self.mappoints:
+                    # 老点：增加观测
+                    mp = self.mappoints[mp_id]
                     mp.add_observation(kf.get_id(), pt_2d)
-                
-                # 情况 B: 这是一个已知的全局地图点 (这种情况在回环或重定位时发生，暂不展开，视作本地化)
-                elif mp_id in self.global_mappoints:
-                    # TODO: 策略：如果老点被新帧看到，通常应该将其拉回 local map 参与优化
-                    pass 
-                
-                # 情况 C: 新产生的地图点 (Candidate)
                 else:
+                    # 新点：创建，这里是CANDIDATE状态
                     new_mp = MapPoint(mp_id, kf.get_id(), pt_2d)
-                    self.local_mappoints[mp_id] = new_mp
+                    self.mappoints[mp_id] = new_mp
             
-            # 3. 检查窗口大小，执行边缘化策略
-            if len(self.active_keyframes) > self.max_active_keyframes:
-                self.manage_sliding_window()
-
-    def manage_sliding_window(self):
-        """
-        核心逻辑：滑动窗口管理
-        将最老的关键帧移入 Global，并检查其观测的地图点是否需要随之移入 Global
-        注意：此函数通常在 add_keyframe 内部调用，由于使用了 RLock，不需要再次加锁，
-        但如果是外部单独调用，则需要加锁。为安全起见，保留 with lock 习惯，或者依赖外部调用。
-        """
-        # 1. 找到最老的活跃关键帧
-        oldest_kf = min(self.active_keyframes.values(), key=lambda kf: kf.get_timestamp())
-        oldest_kf_id = oldest_kf.get_id()
-
-        print(f"[MapManager] Window full. Archiving KF {oldest_kf_id} to Global.")
-
-        # 2. 将 KF 移入 Global 列表
-        self.global_keyframes[oldest_kf_id] = oldest_kf
-        del self.active_keyframes[oldest_kf_id]
-
-        # 3. 检查该 KF 观测到的所有 MapPoints
-        # 我们需要判断这些点是留在 Local 还是移入 Global
-        # 获取该帧观测到的所有 MP ID (假设 KF 有这个方法获取所有特征ID)
-        observed_mp_ids = oldest_kf.get_visual_feature_ids()
-        
-        mps_to_move_to_global = []
-        mps_to_delete = []
-
-        for mp_id in observed_mp_ids:
-            if mp_id not in self.local_mappoints:
-                continue
-            
-            mp = self.local_mappoints[mp_id]
-            
-            # --- 关键判断逻辑 ---
-            # 检查该点是否还被窗口内 **其他** 活跃关键帧观测到
-            is_still_active = False
-            
-            # 遍历该点的所有观测记录 {kf_id: obs}
-            # mp.observations 存储了所有观测到该点的 kf_id
-            for obs_kf_id in mp.get_observing_kf_ids():
-                if obs_kf_id in self.active_keyframes:
-                    is_still_active = True
-                    break
-            
-            if is_still_active:
-                # A. 仍然活跃：保留在 local_mappoints
-                continue
-            else:
-                # B. 不再活跃：移出 local
-                # 没有任何活跃帧能看到它了，追踪断了
-                # 只有三角化成功的点才值得存入全局地图
-                if mp.status == MapPointStatus.TRIANGULATED:
-                    mps_to_move_to_global.append(mp_id)
-                else:
-                    # 还没三角化就滑出了窗口，说明初始化不好或那是外点，直接删除
-                    mps_to_delete.append(mp_id)
-
-        # 执行移动操作
-        for mp_id in mps_to_move_to_global:
-            self.global_mappoints[mp_id] = self.local_mappoints[mp_id]
-            del self.local_mappoints[mp_id]
-        
-        # 执行删除操作
-        for mp_id in mps_to_delete:
-            del self.local_mappoints[mp_id]
-
-        print(f"[MapManager] Moved {len(mps_to_move_to_global)} MPs to Global, Deleted {len(mps_to_delete)} candidates.")
+            # TODO：关键帧剔除策略？
 
     def remove_observation_both_sides(self, mp_id, kf_id):
         """
@@ -143,7 +60,7 @@ class MapManager:
         """
         with self.map_lock:
             # 1. 从 MapPoint 中移除对 KeyFrame 的引用
-            mp = self.local_mappoints.get(mp_id)
+            mp = self.mappoints.get(mp_id)
             if mp:
                 mp.remove_observation(kf_id)
             
@@ -174,7 +91,7 @@ class MapManager:
             
             # 3. 更新点
             for mp_id, pos_3d in optimized_points.items():
-                if mp_id in self.local_mappoints:
+                if mp_id in self.mappoints:
                     self.local_mappoints[mp_id].set_triangulated(pos_3d)
             
             # 4. Map Point Culling (清理质量差的点)
@@ -184,10 +101,10 @@ class MapManager:
             
             # 只需要检查参与了优化的点 (optimized_points 的 key)
             for mp_id in optimized_points.keys():
-                if mp_id not in self.local_mappoints:
+                if mp_id not in self.mappoints:
                     continue
                 
-                mp = self.local_mappoints[mp_id]
+                mp = self.mappoints[mp_id]
                 
                 # 检查观测数量
                 # 注意：mp.get_observing_kf_ids() 返回的是所有观测（包含 Global 的）
@@ -212,81 +129,62 @@ class MapManager:
         """内部调用，不加锁，移除双向引用"""
         # 1. KeyFrame 端移除
         kf = None
-        if kf_id in self.active_keyframes:
-            kf = self.active_keyframes[kf_id]
-        elif kf_id in self.global_keyframes:
-            kf = self.global_keyframes[kf_id]
+        if kf_id in self.keyframes:
+            kf = self.keyframes[kf_id]
             
         if kf:
             kf.remove_features_by_ids([mp_id])
             
         # 2. MapPoint 端移除
-        if mp_id in self.local_mappoints:
-            self.local_mappoints[mp_id].remove_observation(kf_id)
-        elif mp_id in self.global_mappoints:
-            self.global_mappoints[mp_id].remove_observation(kf_id)
+        if mp_id in self.mappoints:
+            self.mappoints[mp_id].remove_observation(kf_id)
 
     def _delete_mappoint(self, mp_id):
         """彻底删除一个地图点，移除它在所有帧上的引用"""
-        mp = self.local_mappoints.get(mp_id)
+        mp = self.mappoints.get(mp_id)
         if not mp:
             return
             
-        # TODO：这里有些奇怪，因为普通帧的数据不归map_manager管理，那么是否需要把该点从普通帧的特征列表中移除？
         # 遍历该点所有的观测帧，把该点从那些帧的特征列表中移除
         # 这一步很重要，否则 Frame 会持有一个指向“已删除点”的 ID
         obs_frames = mp.get_observing_kf_ids()
         for kf_id in obs_frames:
-            kf = self.active_keyframes.get(kf_id)
-            if not kf:
-                kf = self.global_keyframes.get(kf_id)
+            kf = self.keyframes.get(kf_id)
             
             if kf:
                 kf.remove_features_by_ids([mp_id])
         
         # 从字典删除
-        del self.local_mappoints[mp_id]
+        del self.mappoints[mp_id]
 
     # --- 数据访问接口 (Getter) ---
     def get_keyframe(self, kf_id):
         """优先查找 active，其次查找 global"""
         with self.map_lock:
-            if kf_id in self.active_keyframes:
-                return self.active_keyframes[kf_id]
-            return self.global_keyframes.get(kf_id)
+            return self.keyframes.get(kf_id)
 
     def get_map_point(self, mp_id):
         """优先查找 local，其次查找 global"""
         with self.map_lock:
-            if mp_id in self.local_mappoints:
-                return self.local_mappoints[mp_id]
-            return self.global_mappoints.get(mp_id)
+            return self.mappoints.get(mp_id)
 
-    def get_active_keyframes(self):
+    def get_triangulated_mappoints(self):
         with self.map_lock:
-            return sorted(self.active_keyframes.values(), key=lambda kf: kf.get_id()) # 返回列表
+            return {mp.id: mp.position_3d for mp in self.mappoints.values() if mp.status == MapPointStatus.TRIANGULATED}
 
-    def get_active_mappoints(self):
+    def get_keyframes(self):
         with self.map_lock:
-            # 仅返回 local 中已三角化的点用于前端追踪/优化
-            return {mp.id: mp.position_3d for mp in self.local_mappoints.values() if mp.status == MapPointStatus.TRIANGULATED}
-
-    def get_global_mappoints(self):
-        with self.map_lock:
-            # 仅返回 global 中已三角化的点用于前端追踪/优化(理论上这里应该都是三角化的点)
-            return {mp.id: mp.position_3d for mp in self.global_mappoints.values() if mp.status == MapPointStatus.TRIANGULATED}
+            return sorted(self.keyframes.values(), key=lambda kf: kf.get_id()) # 返回列表
 
     # --- 辅助功能 ---
     def reset(self):
         print(f"[MapManager] Resetting all maps.")
-        self.active_keyframes.clear()
-        self.local_mappoints.clear()
-        self.global_keyframes.clear()
-        self.global_mappoints.clear()
+        self.keyframes.clear()
+        self.mappoints.clear()
 
     def check_mappoint_health(self, mappoint_id, candidate_position_3d=None):
         with self.map_lock:
-            mp = self.local_mappoints.get(mappoint_id)
+            mp = self.mappoints.get(mappoint_id)
             if not mp:
                 return False
 
@@ -303,9 +201,9 @@ class MapManager:
             else:
                 return False
 
-            # 获取活跃窗口中的观测帧
+            # 获取观测帧
             observing_kf_ids = mp.get_observing_kf_ids()
-            witness_kfs = [self.active_keyframes[kf_id] for kf_id in observing_kf_ids if kf_id in self.active_keyframes]
+            witness_kfs = [self.keyframes[kf_id] for kf_id in observing_kf_ids if kf_id in self.keyframes]
             witness_kfs.sort(key=lambda x: x.get_id())
 
             # 至少需要两个观测帧
@@ -369,48 +267,186 @@ class MapManager:
 
             return True
 
+    # 共视图相关
+    def update_covisibility_graph(self, frame, last_kf_id):
+        """
+        [核心功能] 三角化后调用。
+        1. 统计当前帧与所有邻居的共视权重。
+        2. 双向更新：更新邻居对当前帧的权重，更新当前帧对邻居的权重。
+        3. 扩充局部地图：将邻居看到但当前帧没看到的点加入 local_map_ids。
+        """
+        with self.map_lock: # 确保线程安全
+            
+            # 1. 初始化
+            # map_cov_kfs: 字典 {kf_id: shared_count}
+            # 这里的共视点是CANDIDATE或TRIANGULATED
+            map_cov_kfs = {} 
+            # set_local_map_ids: 集合 {mp_id}，用于收集邻居的地图点
+            set_local_map_ids = set()
+            
+            # 获取当前帧所有特征点ID
+            current_mp_ids = frame.get_visual_feature_ids()
+
+            # ---------------------------------------------------------
+            # Step 1: 遍历特征点，建立共视连接 (Identify Neighbors)
+            # ---------------------------------------------------------
+            for mp_id in current_mp_ids:
+                # 获取地图点对象（这里计算共视分数时可以是CANDIDATE）
+                map_point = self.get_map_point(mp_id)
+                
+                # 如果点无效 (可能被剔除)，跳过
+                if map_point is None:
+                    # 进行无效观测剔除
+                    self._remove_observation_internal(mp_id, frame.get_id())
+                    continue
+
+                # 获取观测到该点的所有关键帧
+                observing_kf_ids = map_point.get_observing_kf_ids()
+
+                for kf_id in observing_kf_ids:
+                    # 跳过自己
+                    if kf_id != frame.get_id():
+                        # 权重 +1
+                        map_cov_kfs[kf_id] = map_cov_kfs.get(kf_id, 0) + 1
+
+            # ---------------------------------------------------------
+            # Step 2: 更新邻居状态 & 收集局部地图 (Update Neighbors)
+            # ---------------------------------------------------------
+            bad_kf_ids = set()
+            
+            for kf_id, cov_score in map_cov_kfs.items():
+                pkf = self.get_keyframe(kf_id)
+                
+                if pkf is not None:
+                    # A. 双向更新 (Update Neighbor's Graph)
+                    # 告诉共视KF：我和你有 cov_score 这么多共视点
+                    pkf.add_covisible_kf(frame.get_id(), cov_score)
+
+                    # B. 局部地图扩充 (Local Map Expansion)
+                    # 遍历共视KF看到的点，如果是当前帧没见过的 3D 点，加入候选集
+                    neighbor_mp_ids = pkf.get_visual_feature_ids()
+                    
+                    for neighbor_mp_id in neighbor_mp_ids:
+                        # 只有当前帧没观测到的点才叫"扩充"
+                        if not frame.is_observing_feature(neighbor_mp_id):
+                            # 进一步检查点是否有效且是3D点
+                            neighbor_mp = self.get_map_point(neighbor_mp_id)
+                            if neighbor_mp is not None and neighbor_mp.status == MapPointStatus.TRIANGULATED:
+                                set_local_map_ids.add(neighbor_mp_id)
+                else:
+                    bad_kf_ids.add(kf_id)
+
+            # 清理无效的关键帧
+            for kf_id in bad_kf_ids:
+                del map_cov_kfs[kf_id]
+            
+            # ---------------------------------------------------------
+            # Step 3: 更新当前帧状态 (Update Current Frame)
+            # ---------------------------------------------------------
+            # A. 保存共视图
+            frame.set_covisible_map(map_cov_kfs)
+
+            # B. 局部地图融合策略
+            # 继承上一个KF的局部地图
+            baseline_ids = set()
+            if last_kf_id is not None:
+                last_kf = self.get_keyframe(last_kf_id)
+                if last_kf:
+                    baseline_ids = last_kf.get_local_map_ids()
+
+            if len(baseline_ids) == 0:
+                # 冷启动情况：直接使用新的
+                frame.set_local_map_ids(set_local_map_ids)
+            
+            if len(set_local_map_ids) > 0.5 * len(baseline_ids):
+                # 替换：说明新的共视关系带来的点更有价值
+                frame.set_local_map_ids(set_local_map_ids)
+            else:
+                # 合并：补充进来
+                merged_ids = baseline_ids.copy() 
+                merged_ids.update(set_local_map_ids)
+                frame.set_local_map_ids(merged_ids)
+
+            print(f"[MapManager] Updated Covisibility: KF {frame.get_id()} local map size: {len(frame.get_local_map_ids())}")
+
     def get_best_covisibility_keyframes(self, target_kf_id, top_k=5):
         """
-        寻找与 target_kf_id 共视程度最高的 K 个关键帧
+        [辅助查询] 获取共视程度最高的 K 个关键帧。
+        通常用于 Local BA 或 Loop Closure 选帧。
+        """
+        target_kf = self.get_keyframe(target_kf_id)
+        if not target_kf: return {}
+        
+        # 直接读取已经计算好的共视图 (O(1))，不用重新遍历特征点！
+        # 这就是先执行 update_covisibility_graph 的好处
+        cov_map = target_kf.get_covisible_map()
+        
+        # 排序
+        sorted_kfs = sorted(cov_map.items(), key=lambda item: item[1], reverse=True)
+        
+        # 返回前 K 个
+        return dict(sorted_kfs[:top_k])
+
+    def merge_mappoints(self, prev_mpid, new_mpid, cur_frame):
+        """
+        [核心功能] 合并两个地图点。
+        将 prev_mpid 的所有信息（观测、描述子）转移给 new_mpid 然后删除prev_mpid
+        注意这里prev_mpid是新点,new_mpid才是历史点
         """
         with self.map_lock:
-            target_kf = self.get_keyframe(target_kf_id)
-            if not target_kf:
-                return []
-            
-            # 统计共视权重 {kf_id: count}
-            covisibility_counts = {}
-            
-            # 1. 遍历当前帧的所有特征点
-            feature_ids = target_kf.get_visual_feature_ids()
-            
-            for mp_id in feature_ids:
-                mp = self.get_map_point(mp_id)
-                if not mp: continue
-                
-                # 2. 查看该点还被谁观测到了
-                # 这里会自动包含 Local 和 Global 的所有帧，完全打通了界限
-                for obs_kf_id in mp.get_observing_kf_ids():
-                    if obs_kf_id == target_kf_id:
-                        continue
-                    
-                    if obs_kf_id not in covisibility_counts:
-                        covisibility_counts[obs_kf_id] = 0
-                    covisibility_counts[obs_kf_id] += 1
-            
-            # 3. 排序 (权重从大到小)
-            # 转换为 list of (kf_id, count)
-            sorted_kfs = sorted(covisibility_counts.items(), key=lambda item: item[1], reverse=True)
-            
-            # 4. 获取 KeyFrame 对象
-            result_kfs = []
-            for kf_id, count in sorted_kfs[:top_k]:
-                kf = self.get_keyframe(kf_id)
-                if kf:
-                    result_kfs.append(kf)
-                    
-            return result_kfs
+            # 1. 获取对象 & 基础检查
+            prev_mp = self.mappoints.get(prev_mpid)
+            new_mp = self.mappoints.get(new_mpid)
 
+            if prev_mp is None:
+                print(f"[MapManager] Merge skip: keep_mp {prev_mpid} not found")
+                return
+            if new_mp is None:
+                print(f"[MapManager] Merge skip: remove_mp {new_mpid} not found")
+                return
+            
+            # 只能合并进已三角化的点
+            if new_mp.status != MapPointStatus.TRIANGULATED:
+                print(f"[MapManager] Merge skip: keep_mp {new_mpid} is not TRIANGULATED")
+                return
+
+            # {kf_id: pt_2d}
+            prev_kf_ids = list(prev_mp.observations.keys())
+            
+            # 3. 遍历旧点（前端观测的新点）的所有观测帧，将它们重定向到新点（历史点）
+            for kf_id in prev_kf_ids:
+                kf = self.keyframes.get(kf_id)
+                if kf is not None:
+                    # 更新关键帧内部的 ID 引用，将当前KF观测的新点ID替换成局部地图点的观测历史ID
+                    if kf.replace_mappoint_id(prev_mpid, new_mpid):
+                        obs_pt = prev_mp.observations[kf_id]
+                        desc = prev_mp.descriptors.get[kf_id]
+                        new_mp.add_observation(kf_id, obs_2d=obs_pt, descriptor=desc) # 添加当前KF的观测
+
+                        # 共视图操作，为当前KF添加历史共视，为历史KF添加当前共视
+                        new_kf_ids = new_mp.get_observing_kf_ids()
+                        for new_kf_id in new_kf_ids:
+                            if new_kf_id == kf_id: continue
+                            new_kf = self.keyframes.get(new_kf_id)
+                            if new_kf is not None:
+                                kf.add_covisible_kf(new_kf_id, 1)
+                                new_kf.add_covisible_kf(kf_id, 1)
+
+            # 描述子转移
+            for kf_id, desc in prev_mp.descriptors.items():
+                if kf_id not in new_mp.descriptors:
+                    new_mp.add_descriptor(kf_id, desc)
+
+            if cur_frame is not None:
+                if cur_frame.is_observing_feature(prev_mpid):
+                    if cur_frame.replace_mappoint_id(prev_mpid, new_mpid):
+                        pass
+            
+            # 清除多出来的当前帧观测的新点
+            del self.mappoints[prev_mpid]
+            print(f"[MapManager] Merged MP {prev_mpid} -> {new_mpid}. New obs count: {len(new_mp.observations)}")
+
+    # 检查优化后地图点
     def check_mappoint_health_after_optimization(self, mappoint_id):
         mp = self.local_mappoints.get(mappoint_id)
         # 必须是已三角化的点才有3D位置
