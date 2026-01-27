@@ -34,34 +34,29 @@ class FeatureExtractor:
         current_features = frame.get_visual_features()
         current_pts = []
         # print(f"[FeatureExtractor] current_features: {len(current_features)}")
-        if len(current_features) > 0:
-            current_pts = current_features[:, 0, :] # (N, 2)
+        # if len(current_features) > 0:
+        #     current_pts = current_features[:, 0, :] # (N, 2)
 
-            # 计算光流追踪的描述子
-            tracked_descs, valid_mask = self._compute_descriptors(gray_image, current_features)
+        #     # 计算光流追踪的描述子
+        #     # 这里valid_mask的长度应该和输入的current_features的长度一致
+        #     tracked_descs, valid_mask = self._compute_descriptors(gray_image, current_features)
             
-            # 如果部分点移到了图像边缘无法计算描述子，必须将其剔除
-            # 否则它们会占用网格，但实际上已经不可用了
-            if not np.all(valid_mask):
-                frame.remove_outliers_by_mask(valid_mask)
-                
-                # 剔除后必须同步更新 current_pts，否则 mask 会错误地屏蔽掉空闲区域
-                current_features = frame.get_visual_features()
-                if len(current_features) > 0:
-                    current_pts = current_features[:, 0, :]
-                else:
-                    current_pts = []
-                
-                # valid_mask 已经对齐了 tracked_descs，所以描述子列表是纯净的
-                tracked_descs = tracked_descs 
+        #     if len(frame.descriptors) != len(current_features):
+        #         # 初始化全 0 (即你想要的 None/Empty 状态)
+        #         print(f"[FeatureExtractor] Initializing descriptors with zeros")
+        #         frame.descriptors = np.zeros((len(current_features), 32), dtype=np.uint8)
 
-            # 将更新后的描述子存入 Frame
-            if len(frame.get_visual_features()) > 0:
-                frame.descriptors = tracked_descs
+        #     # 仅更新有效描述子
+        #     if np.sum(valid_mask) > 0:
+        #         frame.descriptors[valid_mask] = tracked_descs
 
         features_needed = self.max_kps - frame.get_n_occupied_cells()
         # print(f"[FeatureExtractor] features_needed: {features_needed}")
         if features_needed > 0:
+            current_pts = []
+            if len(current_features) > 0:
+                current_pts = current_features[:, 0, :]
+
             # 2.调用Single Scale Grid Detect提取新点
             new_pts = self.detect_single_scale(gray_image, current_pts)
 
@@ -69,11 +64,14 @@ class FeatureExtractor:
             if len(new_pts) > 0:
                 # 格式转换 list -> (N, 1, 2)
                 new_features_np = np.array(new_pts, dtype=np.float32).reshape(-1, 1, 2)
-                new_descs, valid_mask = self._compute_descriptors(gray_image, new_features_np)
+                # new_descs, valid_mask = self._compute_descriptors(gray_image, new_features_np)
                 
-                final_features = new_features_np[valid_mask]
-                if len(final_features) > 0:
-                    self._add_new_features_to_frame(frame, final_features, new_descs)
+                # final_features = new_features_np[valid_mask]
+                # if len(final_features) > 0:
+                    # self._add_new_features_to_frame(frame, new_features_np, None)
+
+                if len(new_features_np) > 0:
+                    self._add_new_features_to_frame(frame, new_features_np, None)
 
     def detect_single_scale(self, image, current_pts):
         """
@@ -87,7 +85,7 @@ class FeatureExtractor:
         n_rows = int(h / cell_size)
         n_cols = int(w / cell_size)
         n_cells = n_rows * n_cols
-        n_half_cell = int(cell_size / 4)
+        n_half_cell = int(cell_size / 4) # mask半径为1/4，这样两个特征点之间至少有1/2的距离
         
         # 2. 占用标记 (Occupancy)
         # voccupcells[row][col] = True/False
@@ -123,12 +121,13 @@ class FeatureExtractor:
                     nb_occupied_count += 1
                     continue
                 
-                # 定义 ROI 坐标
+                # 定义 ROI 坐标（左上角和右下角坐标）
                 x0, y0 = c * cell_size, r * cell_size
                 x1, y1 = min(x0 + cell_size, w), min(y0 + cell_size, h)
                 
                 # 获取 ROI 切片
                 roi_eigen = eigen_map[y0:y1, x0:x1]
+                # 老点距离掩码
                 roi_mask = mask[y0:y1, x0:x1]
                 
                 # --- 第一轮检测 (Primary) ---
@@ -143,9 +142,7 @@ class FeatureExtractor:
                     if 5 < pt_global[0] < w - 5 and 5 < pt_global[1] < h - 5:
                         primary_detections.append(pt_global)
                         
-                        # 在 Mask 上把这个点扣掉，以便找第二个点
-                        # 注意：需要修改 roi_mask，这会影响原 mask 数组吗？
-                        # numpy 切片是视图，修改 roi_mask 会影响 mask，这正是我们要的
+                        # 在 Mask 上把最佳点扣掉，以便找第二个点
                         cv2.circle(roi_mask, max_loc, n_half_cell, 0, -1)
                         
                         # --- 第二轮检测 (Secondary) ---
@@ -210,7 +207,6 @@ class FeatureExtractor:
         if descs is None: return np.empty((0, 32), dtype=np.uint8), np.zeros(len(features_np), dtype=bool)
         
         # 简单对齐：假设顺序没变 (通常 compute 不会乱序，只会剔除)
-        # 更严谨的做法是用坐标匹配，参考上一条回答
         valid_mask = np.zeros(len(features_np), dtype=bool)
         if len(kps_computed) == len(features_np):
              valid_mask[:] = True
@@ -222,7 +218,6 @@ class FeatureExtractor:
             # 遍历所有输入点
             for i, input_pt in enumerate(pts_flat):
                 # 寻找 computed 中是否有距离极近的点 (< 0.01 像素)
-                # 计算输入点到所有 computed 点的距离
                 dists = np.linalg.norm(computed_coords - input_pt, axis=1)
                 if np.min(dists) < 0.01: # 允许 0.01 像素的误差
                     valid_mask[i] = True

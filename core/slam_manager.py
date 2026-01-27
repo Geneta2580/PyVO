@@ -188,7 +188,7 @@ class SLAMManager:
             self.map_manager.update_covisibility_graph(self.cur_frame, last_kf_id=self.last_kf_id)
 
             # 局部地图匹配
-            self.mapper.match_to_local_map(self.cur_frame)
+            # self.mapper.match_to_local_map(self.cur_frame)
 
             # BA优化
             # if n_active_kfs > 3:
