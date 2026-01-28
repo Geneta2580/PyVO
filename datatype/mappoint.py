@@ -42,6 +42,9 @@ class MapPoint:
         self.position_3d = position_3d
         self.status = MapPointStatus.TRIANGULATED
 
+    def get_id(self):
+        return self.id
+
     def get_observation_count(self):
         return len(self.observations)
 
@@ -53,6 +56,14 @@ class MapPoint:
 
     def get_point(self):
         return self.position_3d
+
+    def is_bad(self):
+        num_obs = self.get_observation_count()        
+        if num_obs >= 2 and self.status == MapPointStatus.TRIANGULATED:
+            # self.status = MapPointStatus.CANDIDATE
+            return False
+
+        return True
 
     def is_ready_for_triangulation(self, keyframe_window, min_parallax):
         # 必须是候选点，且至少有2个观测

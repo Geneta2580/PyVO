@@ -86,17 +86,17 @@ class MapManager:
 
             # 2. 更新位姿
             for kf_id, pose_matrix in optimized_poses.items():
-                if kf_id in self.active_keyframes:
-                    self.active_keyframes[kf_id].set_T_w_c(pose_matrix)
+                if kf_id in self.keyframes:
+                    self.keyframes[kf_id].set_T_w_c(pose_matrix)
             
             # 3. 更新点
             for mp_id, pos_3d in optimized_points.items():
                 if mp_id in self.mappoints:
-                    self.local_mappoints[mp_id].set_triangulated(pos_3d)
+                    self.mappoints[mp_id].set_triangulated(pos_3d)
             
             # 4. Map Point Culling (清理质量差的点)
-            # TODO: 这里可以衔接check_mappoint_health_after_optimization
-            # 策略：如果一个点在优化后（剔除外点后），观测数量 < 2，或者深度无效，则删除该点
+            # TODO: 这里可以衔接check_mappoint_health_after_optimization(这里实际可以取消，因为Optimizer已经处理了)
+            # 如果一个点在优化后（剔除外点后），观测数量 < 2，或者深度无效，则删除该点
             deleted_mps = 0
             
             # 只需要检查参与了优化的点 (optimized_points 的 key)
@@ -112,17 +112,139 @@ class MapManager:
                 
                 if n_obs < 2:
                     # 观测太少，认为是不可靠的点，删除
-                    print(f"[MapManager] Culling MP {mp_id} (n_obs={n_obs})")
+                    print(f"【MapManager】: Culling MP {mp_id} (n_obs={n_obs})")
                     self._delete_mappoint(mp_id)
                     deleted_mps += 1
                     continue
-                    
-                # 还可以加一个简单的深度检查（防止优化后点跑到无穷远）
-                # 这里略过，因为 Optimizer 里已经检查过正深度了
                 
-            print(f"[MapManager] Optimized: {len(optimized_poses)} Poses, {len(optimized_points)} Points. "
+            print(f"【MapManager】: Optimized: {len(optimized_poses)} Poses, {len(optimized_points)} Points. "
                   f"Outliers removed: {len(outlier_observations) if outlier_observations else 0}, "
                   f"Culled MPs: {deleted_mps}")
+
+    def map_filtering(self, new_kf):
+        """
+        [Map Pruning] 关键帧剔除策略
+        逻辑复刻自 OV2SLAM Estimator::mapFiltering
+        作用：去除那些信息冗余度过高的关键帧，控制稀疏地图规模。
+        """
+        # 配置参数 (建议从 config 读取)
+        filtering_ratio = self.config.get('kf_filtering_ratio', 0.9) # 冗余阈值 (OV2SLAM 默认 0.9)
+        min_cov_score = self.config.get('min_cov_score', 20)         # 最小共视分数
+        
+        # 1. 基础检查
+        if filtering_ratio >= 1.0:
+            return # 禁用剔除
+        
+        # 保护期：前 20 帧通常用于初始化和稳定，不剔除
+        if new_kf.get_id() < 20: 
+            return
+
+        # 2. 获取共视邻居
+        # OV2SLAM 使用 rbegin() 逆序遍历，意味着优先检查 ID 较大的（最近的）邻居
+        # 物理意义：最近的邻居和当前帧重叠最大，最容易发生冗余
+        cov_kfs_dict = new_kf.get_covisible_map()
+        
+        # 按 ID 降序排列
+        sorted_neighbor_ids = sorted(cov_kfs_dict.keys(), reverse=True)
+
+        with self.map_lock:
+            for kf_id in sorted_neighbor_ids:
+                
+                # 2.1 跳过特殊帧
+                if kf_id == 0: continue # 永远不删第0帧 (世界坐标系原点)
+                if kf_id >= new_kf.get_id(): continue # 不处理未来的帧(虽然理论上不应该有)
+                
+                # TODO: 如果有回环检测 (Loop Closure)，需要跳过当前正在回环的帧
+                # if kf_id == self.last_loop_kf_id: continue
+
+                target_kf = self.get_keyframe(kf_id)
+                if target_kf is None: continue
+
+                # -----------------------------------------------------
+                # 3. 检查条件 A：弱帧剔除 (Weak Frame)
+                # -----------------------------------------------------
+                # 统计该帧观测到的有效 3D 点 (Triangulated)
+                # 注意：这里需要实时获取，因为可能刚才的优化已经剔除了一些点
+                valid_mp_ids = [
+                    mid for mid in target_kf.get_visual_feature_ids() 
+                    if self._is_valid_3d_point(mid)
+                ]
+                n_3d_kps = len(valid_mp_ids)
+
+                # 如果有效点太少，说明质量很差，直接删
+                if n_3d_kps < min_cov_score / 2:
+                    print(f"[MapManager] Culling Weak KF {kf_id} (Valid 3D points: {n_3d_kps} < {min_cov_score/2})")
+                    self.remove_keyframe(kf_id)
+                    continue
+
+                # -----------------------------------------------------
+                # 4. 检查条件 B：冗余帧剔除 (Redundancy Check)
+                # -----------------------------------------------------
+                # 核心逻辑：计算"被良好观测的点"的比例
+                # "良好观测"定义：该点被至少 4 个关键帧观测到
+                
+                n_good_obs = 0
+                n_total = 0
+                
+                for mp_id in valid_mp_ids:
+                    mp = self.get_map_point(mp_id)
+                    if mp is None or mp.is_bad(): continue
+                    
+                    n_total += 1
+                    
+                    # 获取观测该点的所有 KF 数量 (scale 尺度上的冗余)
+                    # get_observing_kf_ids() 返回所有观测该点的 KF ID 列表
+                    n_observations = len(mp.get_observing_kf_ids())
+                    
+                    # OV2SLAM 阈值是 > 4
+                    if n_observations > 4:
+                        n_good_obs += 1
+                
+                if n_total == 0: continue
+
+                # 计算冗余率
+                ratio = n_good_obs / n_total
+                
+                # 如果 90% 以上的点都很"富余"，那这个帧就是多余的
+                if ratio > filtering_ratio:
+                    print(f"[MapManager] Culling Redundant KF {kf_id} (Redundancy Ratio: {ratio:.2f})")
+                    self.remove_keyframe(kf_id)
+
+    def _is_valid_3d_point(self, mp_id):
+        """辅助函数：检查点是否存在且已三角化"""
+        mp = self.get_map_point(mp_id)
+        return mp is not None and not mp.is_bad() and mp.status == MapPointStatus.TRIANGULATED
+
+    def remove_keyframe(self, kf_id):
+        """
+        [重要] 删除关键帧的实现逻辑
+        这不仅仅是从字典里 pop 掉，还需要切断它与地图点的联系
+        """
+        kf = self.get_keyframe(kf_id)
+        if kf is None: return
+
+        # 1. 切断与地图点的联系
+        # 这一点至关重要！如果不切断，地图点会以为自己还被这个死掉的帧观测着
+        for mp_id in kf.get_visual_feature_ids():
+            mp = self.get_map_point(mp_id)
+            if mp:
+                mp.remove_observation(kf_id)
+                # 如果点因为这就没有观测了，也可以顺手删掉（或者留给 culling 机制）
+                if len(mp.get_observing_kf_ids()) == 0:
+                    self._delete_mappoint(mp_id)
+
+        # 2. 从共视图中移除
+        # 需要通知它的邻居："我挂了，把我的连接删掉"
+        for neighbor_id in list(kf.get_covisible_map().keys()):
+            neighbor = self.get_keyframe(neighbor_id)
+            if neighbor:
+                neighbor.remove_covisible_kf(kf_id)
+
+        # 3. 物理删除
+        if kf_id in self.keyframes:
+            del self.keyframes[kf_id]
+        
+        # print(f"[MapManager] KeyFrame {kf_id} removed.")
 
     # --- 辅助内部函数 (不加锁，供内部调用) ---
     def _remove_observation_internal(self, mp_id, kf_id):
@@ -347,27 +469,9 @@ class MapManager:
             frame.set_covisible_map(map_cov_kfs)
 
             # B. 局部地图融合策略
-            # 继承上一个KF的局部地图
-            baseline_ids = set()
-            if last_kf_id is not None:
-                last_kf = self.get_keyframe(last_kf_id)
-                if last_kf:
-                    baseline_ids = last_kf.get_local_map_ids()
-
-            if len(baseline_ids) == 0:
-                # 冷启动情况：直接使用新的
-                frame.set_local_map_ids(set_local_map_ids)
-            
-            if len(set_local_map_ids) > 0.5 * len(baseline_ids):
-                # 替换：说明新的共视关系带来的点更有价值
-                frame.set_local_map_ids(set_local_map_ids)
-            else:
-                # 合并：补充进来
-                merged_ids = baseline_ids.copy() 
-                merged_ids.update(set_local_map_ids)
-                frame.set_local_map_ids(merged_ids)
-
+            frame.set_local_map_ids(set_local_map_ids)
             print(f"[MapManager] Updated Covisibility: KF {frame.get_id()} local map size: {len(frame.get_local_map_ids())}")
+            print(f"[MapManager] Updated Covisibility: KF {frame.get_id()} covisible map size: {len(frame.get_covisible_map())}")
 
     def get_best_covisibility_keyframes(self, target_kf_id, top_k=5):
         """

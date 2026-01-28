@@ -324,6 +324,11 @@ class Frame:
         # 对于已存在的KF，取旧值 + weight
         self.cov_map[kf_id] = self.cov_map.get(kf_id, 0) + weight
 
+    def remove_covisible_kf(self, kf_id):
+        """从共视图中删除对应 ID 的关键帧及其分数"""
+        if kf_id in self.cov_map:
+            del self.cov_map[kf_id]
+
     def set_covisible_map(self, cov_map):
         """设置完整的共视表 (覆盖)"""
         self.cov_map = cov_map

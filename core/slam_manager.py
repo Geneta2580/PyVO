@@ -191,8 +191,9 @@ class SLAMManager:
             # self.mapper.match_to_local_map(self.cur_frame)
 
             # BA优化
-            # if n_active_kfs > 3:
-            #     self.optimizer.optimize()
+            if n_keyframes > 2:
+                self.optimizer.optimize(self.cur_frame)
+                self.map_manager.map_filtering(self.cur_frame)
 
             # 检查初始化质量（初始化完成后(至少两帧，防止重置死循环)，第一个滑窗满之前，检查地图点数量）
             if 2 < n_keyframes < 10:
