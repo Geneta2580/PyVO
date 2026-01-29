@@ -34,7 +34,7 @@ class Optimizer:
         self.K = gtsam.Cal3_S2(fx, fy, s, cx, cy)
 
         # 最小共视分数
-        self.min_cov_score = self.config.get('min_cov_score', 25)
+        self.min_cov_score = self.config.get('min_cov_score', 50)
 
         # 是否应用二阶段优化
         self.apply_l2_optimization = self.config.get('apply_l2_optimization', True)
@@ -101,132 +101,138 @@ class Optimizer:
         print(f"【Optimizer】: =================================================")
 
         # =========================================================================
-        # Step 2: 构建因子图 (构建因子图和初始估计)
+        # Step 2: 构建因子图 (Debug Version)
         # =========================================================================
         graph = gtsam.NonlinearFactorGraph()
         initial_estimate = gtsam.Values()
         
-        # 已添加的状态变量
         added_poses = set()
         added_points = set()
 
-        # 添加待优化帧的位姿初始值
-        for kf in local_kfs:
-            initial_estimate.insert(X(kf.get_id()), gtsam.Pose3(kf.get_T_w_c()))
-            added_poses.add(kf.get_id())
+        # -------------------------------------------------------------------------
+        # 2.1 准备所有 Pose 变量
+        # -------------------------------------------------------------------------
+        all_window_kfs = {} 
+        for kf in local_kfs.union(fixed_kfs):
+            kf_id = kf.get_id()
+            all_window_kfs[kf_id] = kf
+            if kf_id not in added_poses:
+                initial_estimate.insert(X(kf_id), gtsam.Pose3(kf.get_T_w_c()))
+                added_poses.add(kf_id)
+            if kf in fixed_kfs:
+                graph.add(gtsam.PriorFactorPose3(X(kf_id), gtsam.Pose3(kf.get_T_w_c()), self.pose_noise_fix))
 
-        # 添加固定帧状态变量以及先验因子
-        for kf in fixed_kfs:
-            # 如果还没添加进 Values
-            if kf.get_id() not in added_poses:
-                initial_estimate.insert(X(kf.get_id()), gtsam.Pose3(kf.get_T_w_c()))
-                added_poses.add(kf.get_id())
-            
-            # 添加强先验因子，使其固定不动
-            graph.add(gtsam.PriorFactorPose3(
-                X(kf.get_id()), 
-                gtsam.Pose3(kf.get_T_w_c()), 
-                self.pose_noise_fix
-            ))
+        # -------------------------------------------------------------------------
+        # 2.2 添加 MapPoints 和 视觉因子
+        # -------------------------------------------------------------------------
+        # 详细统计丢弃原因
+        stats = {
+            'total_mps': 0,
+            'accepted_mps': 0,
+            'drop_not_in_window': 0, # 观测帧不在当前窗口(local+fixed)
+            'drop_nan': 0,           # 数据无效
+            'drop_depth': 0,         # 深度检查失败 (Z < 0)
+            'drop_transform': 0,     # 坐标变换失败
+            'reject_not_enough': 0,  # 有效观测 < 2
+            'reject_low_parallax': 0 # 视差不足
+        }
 
-        # 添加待优化点的3D位置初始值及视觉因子
         for mp in local_mps:
-            # 添加路标点初始状态变量
-            if mp.get_id() not in added_points:
-                initial_estimate.insert(L(mp.get_id()), mp.get_point())
-                added_points.add(mp.get_id())
+            stats['total_mps'] += 1
+            mp_id = mp.get_id()
+            point_w = mp.get_point()
 
-            # 遍历该点所有观测
+            valid_factors_buffer = [] 
+            valid_observing_kfs = []
+
             obs_kf_ids = mp.get_observing_kf_ids()
-            
+
             for kf_id in obs_kf_ids:
-                if kf_id not in added_poses: 
-                    print(f"[SafeGuard] Skip: KF not in added_poses! KF {kf_id}")
+                # 检查 1: 帧是否存在于窗口
+                if kf_id not in all_window_kfs:
+                    stats['drop_not_in_window'] += 1
+                    # print(f"[Debug] MP {mp_id} obs by KF {kf_id} DROPPED: Not in window")
                     continue
 
-                kf = self.map_manager.get_keyframe(kf_id)
-                if kf is None: 
-                    print(f"[SafeGuard] Skip: KF is None! KF {kf_id}")
+                kf = all_window_kfs[kf_id]
+                uv_unpx = kf.get_feature_undistorted_position(mp_id)
+                
+                # 检查 2: 数据有效性
+                if uv_unpx is None or not np.all(np.isfinite(uv_unpx)):
+                    stats['drop_nan'] += 1
                     continue
 
-                # 获取去畸变观测像素
-                uv_unpx = kf.get_feature_undistorted_position(mp.get_id())
-                if uv_unpx is None: 
-                    print(f"[SafeGuard] Skip: Measurement is None! MP {mp.get_id()}")
-                    continue
-
-                if not np.all(np.isfinite(uv_unpx)):
-                    print(f"[SafeGuard] Skip: Measurement contains NaN! MP {mp.get_id()}")
-                    continue
-
-                unpx_measured = uv_unpx
-
-                # ============================= 安全检查 (防止畸变引起的超大残差) =============================
-                if kf.get_id() in initial_estimate.keys(): # 也就是 added_poses
-                    pose_w_c = initial_estimate.atPose3(X(kf_id))
-                else:
-                    pose_w_c = gtsam.Pose3(kf.get_T_w_c())
-                    
-                if mp.get_id() in initial_estimate.keys():
-                    point_w = initial_estimate.atPoint3(L(mp.get_id()))
-                else:
-                    point_w = mp.get_point()
-
-                if not np.all(np.isfinite(pose_w_c.matrix())):
-                    print(f"[SafeGuard] Skip: Pose contains NaN! KF {kf_id}")
-                    continue
-                if not np.all(np.isfinite(point_w)):
-                    print(f"[SafeGuard] Skip: Point contains NaN! MP {mp.get_id()}")
-                    continue
-
-                # 变换到相机系
+                # 检查 3: 几何深度 (已放宽阈值)
+                pose_w_c = gtsam.Pose3(kf.get_T_w_c())
                 try:
                     point_c = pose_w_c.transformTo(point_w)
+                    # 【修改】将阈值从 0.05 改为 0.001，防止单目尺度过小导致误杀
+                    if point_c[2] < 0.3: 
+                        stats['drop_depth'] += 1
+                        # print(f"[Debug] MP {mp_id} in KF {kf_id} DROPPED: Depth {point_c[2]:.4f} < 0.001")
+                        continue 
                 except:
-                    print(f"[SafeGuard] Skip: Transform to camera frame failed! KF {kf_id} - MP {mp.get_id()}")
+                    stats['drop_transform'] += 1
                     continue
-                
-                if point_c[2] < 0.1:
-                    print(f"[SafeGuard] Skip Factor: KF {kf_id} - MP {mp.get_id()} is behind camera (Z={point_c[2]:.2f})")
-                    continue 
-                # else:
-                #     print(f"[SafeGuard] Accept Factor: KF {kf_id} - MP {mp.get_id()} is too far (Z={point_c[2]:.2f})")
 
-                # 4. 检查重投影是否极其离谱 (可选，防止由畸变引起的超大残差)
-                try:
-                    # 手动投影一下
-                    norm_xy = point_c[:2] / point_c[2]
-                    pred_uv = self.K.uncalibrate(norm_xy)
-                    
-                    # 再次检查投影结果是否有效
-                    if not np.all(np.isfinite(pred_uv)):
-                        print(f"[SafeGuard] Skip: Projected Point is NaN! (Z={point_c[2]})")
-                        continue
-
-                    reproj_err = np.linalg.norm([pred_uv[0] - uv_unpx[0], pred_uv[1] - uv_unpx[1]])
-
-                    # 如果初始残差 > 50 像素，说明这个匹配完全是错的，优化器拉不回来的
-                    if reproj_err > 50.0:
-                        print(f"[SafeGuard] Skip Factor: Large Initial Error ({reproj_err:.2f} px)")
-                        continue
-                    # else:
-                    #     print(f"[SafeGuard] Accept Factor: Large Initial Error ({reproj_err:.2f} px)")
-
-                except:
-                    print(f"[SafeGuard] Skip: Reprojection check failed! KF {kf_id} - MP {mp.get_id()}")
-                    continue
-                # ============================= 安全检查 (防止畸变引起的超大残差) =============================
-
-                # 添加视觉因子
-                graph.add(gtsam.GenericProjectionFactorCal3_S2(
-                    unpx_measured,
+                # 通过所有检查，暂存
+                factor = gtsam.GenericProjectionFactorCal3_S2(
+                    uv_unpx,
                     self.robust_noise_model,
                     X(kf_id),
-                    L(mp.get_id()),
+                    L(mp_id),
                     self.K,
                     self.body_T_cam
-                ))
+                )
+                valid_factors_buffer.append(factor)
+                valid_observing_kfs.append(kf)
 
+            # --- 准入考核 ---
+
+            # 【考核 1】观测数量
+            if len(valid_factors_buffer) < 2:
+                stats['reject_not_enough'] += 1
+                # print(f"[Debug] MP {mp_id} REJECTED: Valid factors {len(valid_factors_buffer)} < 2")
+                continue 
+
+            # # 【考核 2】视差检查
+            # kf_first = valid_observing_kfs[0]
+            # kf_last = valid_observing_kfs[-1]
+            # cam1 = kf_first.get_T_w_c()[:3, 3]
+            # cam2 = kf_last.get_T_w_c()[:3, 3]
+            
+            # baseline = np.linalg.norm(cam1 - cam2)
+            # depth = np.linalg.norm(point_w - cam1)
+
+            # # 视差阈值：0.5度
+            # is_good_parallax = False
+            # if depth > 1e-5: # 防止除0
+            #     ratio = baseline / depth
+            #     if ratio > 0.01: # 约 0.5度
+            #         is_good_parallax = True
+            #     else:
+            #         # 也可以用角度兜底
+            #         vec1 = point_w - cam1
+            #         vec2 = point_w - cam2
+            #         cos_theta = np.dot(vec1/np.linalg.norm(vec1), vec2/np.linalg.norm(vec2))
+            #         angle = np.arccos(np.clip(cos_theta, -1.0, 1.0))
+            #         if angle > np.deg2rad(0.5):
+            #             is_good_parallax = True
+            
+            # if not is_good_parallax:
+            #     stats['reject_low_parallax'] += 1
+            #     continue
+
+            # --- 正式录用 ---
+            stats['accepted_mps'] += 1
+            if mp_id not in added_points:
+                initial_estimate.insert(L(mp_id), point_w)
+                added_points.add(mp_id)
+            
+            for f in valid_factors_buffer:
+                graph.add(f)
+        
+        print(f"【Optimizer】: Graph Debug Stats: {stats}")
         print(f"【Optimizer】: Stage 1 Graph: {graph.size()} factors.")
 
         # =========================================================================
