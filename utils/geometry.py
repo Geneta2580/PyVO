@@ -36,23 +36,21 @@ class MultiViewGeometry:
             print(f"[MultiViewGeometry] Failed to compute Essential Matrix! E: {E}")
             return False, np.eye(3), np.zeros(3), []
 
+        # 立即提取外点mask
+        mask_e = mask_e.flatten()
+        outliers_idx = np.where(mask_e == 0)[0].tolist()
+
+        if len(outliers_idx) >= len(pts1) - 5: 
+            return False, np.eye(3), np.zeros(3), []
+
         # 4. 恢复位姿 R, t (Cheirality Check)
         # recoverPose 会分解 E 矩阵，并三角化点云，选择使点都在相机前方的那个解
-        # 注意：这里传入 mask_e，recoverPose 会进一步更新 mask（剔除位于相机后方的点）
-        inliers_count, R, t, mask_pose = cv2.recoverPose(
+        # 注意：这里传入 mask_e，recoverPose 不更新mask（交给三角化检查以及PnP检查处理）
+        _, R, t, _ = cv2.recoverPose(
             E, pts1, pts2,
             focal=1.0, pp=(0.0, 0.0),
             mask=mask_e
         )
-
-        if inliers_count < 5: # 5点法至少需要5个内点
-            print(f"[MultiViewGeometry] Failed to compute Pose! inliers_count: {inliers_count}")
-            return False, np.eye(3), np.zeros(3), []
-
-        # 5. 提取外点索引
-        # mask_pose: (N, 1) uint8, 0=outlier, 255=inlier
-        mask_pose = mask_pose.flatten()
-        outliers_idx = np.where(mask_pose == 0)[0].tolist()
 
         # R, t 是从 Frame 1 到 Frame 2 的变换: x2 = R * x1 + t  (R_21)
         R_cv = R

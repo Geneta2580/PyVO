@@ -89,6 +89,7 @@ class VisualFrontend:
         self.tracking_tracked_pts = None
         self.tracking_final_status = None
         self.tracking_kp_ids = None  # 保存特征点ID用于内点映射
+        self.tracking_is_3d_mask = None # 保存是否是3D先验追踪
 
         # 日志
         log_columns = [
@@ -243,7 +244,8 @@ class VisualFrontend:
             flat_kp = kp_px.flatten() # (1, 2) -> (2,)
             if map_point is not None and map_point.status == MapPointStatus.TRIANGULATED:
                 # 投影: World -> Image (Distorted) 这里的 T_cw是基于恒速模型预测的位姿
-                proj_px = self.cur_frame.camera.project_world_to_image(self.cur_frame.get_T_w_c(), map_point.get_point())
+                # 这里需要使用畸变投影，以适配未校正畸变的图像
+                proj_px = self.cur_frame.camera.project_world_to_image_dist(self.cur_frame.get_T_w_c(), map_point.get_point())
 
                 # 检查投影点是否在图像内（深度有可能为负，或者超出图像范围）
                 if self.cur_frame.camera.is_in_image(proj_px):
@@ -275,6 +277,7 @@ class VisualFrontend:
         all_tracked_pts = []
         all_final_status = []
         all_kp_ids = []  # 保存特征点ID用于后续内点映射
+        all_is_3d_mask = [] # 保存是否是3D先验追踪
         nb_good_3d = 0 # 跟踪到的 3D 点数量
         
         if len(valid_3d_kp_ids) > 0:
@@ -296,6 +299,7 @@ class VisualFrontend:
             all_tracked_pts.extend(tracked_pts)
             all_final_status.extend(status)
             all_kp_ids.extend(valid_3d_kp_ids)
+            all_is_3d_mask.extend([True] * len(valid_3d_kp_ids))
 
             # 处理跟踪结果
             tracked_3d_list = []
@@ -356,6 +360,7 @@ class VisualFrontend:
             all_tracked_pts.extend(tracked_pts)
             all_final_status.extend(status)
             all_kp_ids.extend(valid_2d_kp_ids)
+            all_is_3d_mask.extend([False] * len(valid_2d_kp_ids))
 
             tracked_2d_list = []
             ids_2d_list = []
@@ -399,6 +404,7 @@ class VisualFrontend:
                 curr_image_bgr,
                 all_prev_pts, all_tracked_pts, all_final_status,
                 inliers_mask=None,
+                is_3d_mask=np.array(all_is_3d_mask, dtype=bool),
                 window_name="KLT Tracking (Before Epipolar Filtering)",
                 show_stats=True,
                 frame_id=self.cur_frame.get_id(),
@@ -412,6 +418,7 @@ class VisualFrontend:
             self.tracking_tracked_pts = all_tracked_pts
             self.tracking_final_status = all_final_status
             self.tracking_kp_ids = all_kp_ids  # 保存ID用于内点映射
+            self.tracking_is_3d_mask = np.array(all_is_3d_mask, dtype=bool)
         
         return nb_good_3d
     
@@ -536,10 +543,10 @@ class VisualFrontend:
             return
 
         # 剔除 Outliers - 批量删除，避免循环中多次重建索引
+        ids_to_remove = []
+        ids_to_remove_3d = []
         if len(outliers_idx) > 0:
             all_outlier_ids = np.array(valid_kps_ids)[outliers_idx]
-            ids_to_remove = []
-            ids_to_remove_3d = []
             
             # TODO：这里可能要删除已三角化的外点，先记录
             for kp_id in all_outlier_ids:
@@ -590,6 +597,7 @@ class VisualFrontend:
                 curr_image_bgr,
                 self.tracking_prev_pts, self.tracking_tracked_pts, self.tracking_final_status,
                 inliers_mask=inliers_mask,
+                is_3d_mask=self.tracking_is_3d_mask,
                 window_name="KLT Tracking (After Epipolar Filtering)",
                 show_stats=True,
                 frame_id=self.cur_frame.get_id(),
@@ -602,6 +610,7 @@ class VisualFrontend:
                 curr_image_bgr,
                 self.tracking_prev_pts, self.tracking_tracked_pts, self.tracking_final_status,
                 inliers_mask=inliers_mask,
+                is_3d_mask=self.tracking_is_3d_mask,
                 window_name="Epipolar Filtered Tracking (Inliers Only)",
                 show_stats=True,
                 frame_id=self.cur_frame.get_id(),
@@ -852,7 +861,7 @@ class VisualFrontend:
         
         # 2. P3P RANSAC (如果需要，追踪3d点较少，追踪质量较差时使用)
         # TODO: 暂时设为True，应该为self.do_p3p
-        if True:
+        if self.do_p3p:
             print(f"[VisualFrontEnd Compute Pose] Running P3P RANSAC on {len(np_bvs)} points...")
 
             success, p3p_pose, outliers_idx = MultiViewGeometry.p3p_ransac(
