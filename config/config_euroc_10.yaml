@@ -5,7 +5,7 @@
 # euroc：/home/pangjunxiang/dataset/Euroc/MH_01_easy
 # tum：/home/pangjunxiang/dataset/TUM/freiburg1
 # kitti:
-dataset_path: "/home/geneta/dataset/source_dataset/euroc/MH_01_easy"
+dataset_path: "/home/geneta/dataset/source_dataset/euroc/V1_02_medium"
 
 # 支持euroc\tum\kitti数据集
 dataset_type: "euroc"
@@ -54,7 +54,10 @@ do_random: True
 ransac_err: 3.0
 
 # 初始化判定视差阈值
-init_parallax: 20.0
+init_parallax: 10.0
+
+# 关键帧最小视差
+keyframe_min_parallax: 10
 
 # 三角化参数
 triangulation_max_reprojection_error: 3.0 # 新地图点三角化最大重投影误差

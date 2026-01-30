@@ -412,13 +412,14 @@ class Optimizer:
             # 5.4 执行二阶段优化
             # -----------------------------------------------------
             try:
-                params.setMaxIterations(10)
-                params.setRelativeErrorTol(1e-3)
-                params.setAbsoluteErrorTol(1e-3)
-                params.setVerbosityLM("SUMMARY") 
+                params_l2 = gtsam.LevenbergMarquardtParams()
+                params_l2.setMaxIterations(10)
+                params_l2.setRelativeErrorTol(1e-3)
+                params_l2.setAbsoluteErrorTol(1e-3)
+                params_l2.setVerbosityLM("SUMMARY") 
                 
                 t3 = time.time()
-                optimizer = gtsam.LevenbergMarquardtOptimizer(new_graph, new_estimate, params)
+                optimizer = gtsam.LevenbergMarquardtOptimizer(new_graph, new_estimate, params_l2)
                 result = optimizer.optimize()
                 t4 = time.time()
 

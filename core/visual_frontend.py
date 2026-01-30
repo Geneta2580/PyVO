@@ -89,6 +89,9 @@ class VisualFrontend:
 
         # 是否使用P3P
         self.do_p3p = False
+
+        # 关键帧最小视差
+        self.keyframe_min_parallax = config.get('keyframe_min_parallax', 20)
         
         # 可视化选项
         self.visualize_optical_flow = config.get('visualize_optical_flow', False)
@@ -1025,7 +1028,7 @@ class VisualFrontend:
         # 条件 3: 视差或立体视觉间隔
         # ---------------------------------------------------------------------
         # 基础条件 cx: 视差达到阈值的一半 (或者立体模式下的帧间隔)
-        min_parallax_threshold = self.config['init_parallax']
+        min_parallax_threshold = self.keyframe_min_parallax
         cx = med_rot_parallax >= min_parallax_threshold / 2.0
 
         # ---------------------------------------------------------------------

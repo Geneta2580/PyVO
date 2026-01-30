@@ -1,0 +1,82 @@
+# ----------------------------------------------------------------------------
+# 数据集参数 (Dataset Parameters)
+# ----------------------------------------------------------------------------
+# 数据集根目录的路径
+# euroc：/home/pangjunxiang/dataset/Euroc/MH_01_easy
+# tum：/home/pangjunxiang/dataset/TUM/freiburg1
+# kitti:
+dataset_path: "/home/geneta/dataset/source_dataset/euroc/MH_01_easy"
+
+# 支持euroc\tum\kitti数据集
+dataset_type: "euroc"
+
+# ============================================= 视觉前端配置参数 =============================================
+# 相机内参
+cam_intrinsics: [458.654, 0.000, 367.215,
+                 0.000, 457.296, 248.375, 
+                 0.000, 0.000, 1.000]
+
+# 相机畸变参数
+use_undistort: True
+camera_model: "pinhole"
+distortion_coefficients: [-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05]
+alpha: 0
+
+# 图像大小
+image_width: 752
+image_height: 480
+
+# 最大特征点数
+max_features_to_detect: 300
+
+# 网格单元大小
+grid_cell_size: 35
+
+# 最大质量等级
+max_quality_level: 0.001
+
+# CLAHE参数
+use_clahe: True
+clahe_value: 2.0
+
+# KLT参数
+window_size: 9
+pyramid_levels: 3
+nmax_iters: 30 # KLT最大迭代次数
+klt_err: 30.0 # KLT误差阈值
+max_fb_dist: 1.0 # 前后向追踪的FB距离阈值
+
+# 使用运动模型预测光流
+klt_use_prior: True
+
+# RANSAC相关参数
+do_random: True
+ransac_err: 3.0
+
+# 初始化判定视差阈值
+init_parallax: 20.0
+
+# 关键帧最小视差
+keyframe_min_parallax: 20
+
+# 三角化参数
+triangulation_max_reprojection_error: 3.0 # 新地图点三角化最大重投影误差
+triangulation_max_depth: 100 # 新地图点三角化最大深度
+triangulation_min_depth: 0.1 # 新地图点三角化最小深度
+
+# ============================================= 调试模式配置 =============================================
+# 单帧运行debug模式：设置为True时，每处理一帧后暂停，等待用户输入继续
+debug_single_frame: False
+
+# 可视化光流追踪结果：设置为True时，显示光流追踪的可视化结果
+visualize_optical_flow: True
+
+# open3d可视化
+use_viewer: False
+# Open3D初始显示范围（单位：米），控制窗口的初始视图范围
+# 值越大，初始显示范围越大，能看到更大的场景
+# 建议值：50-200（小场景），200-500（中等场景），500-1000（大场景）
+viewer_initial_range: 200.0
+
+# ============================================= 输出结果配置 =============================================
+log_dir: "output/log"
