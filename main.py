@@ -68,6 +68,7 @@ def main():
     slam_manager.start_all_threads()
 
     # 使用包装器，在main中进行图像读取
+    print("[Main Process] Starting data loader...")
     data_loader = DataloaderWrapper(base_data_loader)
 
     # 检查是否启用调试模式

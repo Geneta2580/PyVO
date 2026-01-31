@@ -210,6 +210,7 @@ class MapManager:
                     print(f"[MapManager] Culling Redundant KF {kf_id} (Redundancy Ratio: {ratio:.2f})")
                     self.remove_keyframe(kf_id)
 
+    # --- 辅助内部函数 (不加锁，供内部调用) ---
     def _is_valid_3d_point(self, mp_id):
         """辅助函数：检查点是否存在且已三角化"""
         mp = self.get_map_point(mp_id)
@@ -246,7 +247,6 @@ class MapManager:
         
         # print(f"[MapManager] KeyFrame {kf_id} removed.")
 
-    # --- 辅助内部函数 (不加锁，供内部调用) ---
     def _remove_observation_internal(self, mp_id, kf_id):
         """内部调用，不加锁，移除双向引用"""
         # 1. KeyFrame 端移除

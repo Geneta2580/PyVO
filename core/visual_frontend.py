@@ -151,6 +151,7 @@ class VisualFrontend:
     def visual_tracking(self, prev_frame, cur_frame, timestamp):
         print(f"[VisualFrontend] Mono tracking: {timestamp}")
 
+        need_recovery = False
         self.prev_frame = prev_frame
         self.cur_frame = cur_frame
 
@@ -168,7 +169,7 @@ class VisualFrontend:
 
             self.prev_frame = self.cur_frame
             self.prev_gray = curr_gray
-            return True, curr_gray
+            return True, curr_gray, need_recovery
 
         # 设置参考关键帧：普通帧继承上一帧的参考关键帧
         if self.prev_frame is not None:
@@ -188,7 +189,7 @@ class VisualFrontend:
         self.cur_frame.set_T_w_c(T_wc_pred)
 
         # 追踪新帧
-        n_tracked_valid_3d = self.KLT_tracking(self.prev_gray, curr_gray)
+        n_tracked_valid_3d, need_recovery = self.KLT_tracking(self.prev_gray, curr_gray)
 
         # 对极约束去除外点（有必要则使用E矩阵更新位姿，否则直接使用运动模型预测的位姿）
         self.epipolar_filtering(n_tracked_valid_3d)
@@ -197,17 +198,17 @@ class VisualFrontend:
         if not self.visual_init_ready:
             # 经过光流追踪和对极约束去除外点后，特征点数量仍然较少，无法进行视觉初始化
             if(len(self.cur_frame.get_visual_feature_ids()) < 50):
-                return False, curr_gray
+                return False, curr_gray, need_recovery
             elif self.check_ready_for_init():
                 print(f'[VisualFrontend] Ready for visual initialization!')
                 self.visual_init_ready = True
 
                 # 第二帧更新运动模型（初始位姿，时间戳）
                 self.motion_model.update_motion_model(self.cur_frame.get_T_w_c(), timestamp)
-                return True, curr_gray # 直接返回True，不进行后续处理
+                return True, curr_gray, need_recovery # 直接返回True，不进行后续处理
             else:
                 print(f'[VisualFrontend] Not ready for visual initialization!')
-                return False, curr_gray
+                return False, curr_gray, need_recovery
 
         # 计算位姿
         self.compute_pose(n_tracked_valid_3d)
@@ -226,7 +227,7 @@ class VisualFrontend:
         self.logger.finish_frame(timestamp)
 
         # 返回关键帧判断结果和灰度图（用于后续关键帧创建）
-        return is_new_kf, curr_gray
+        return is_new_kf, curr_gray, need_recovery
 
     def preprocess_image(self, cur_image):
         print(f"[VisualFrontend] Preprocessing image")
@@ -239,6 +240,8 @@ class VisualFrontend:
         
     def KLT_tracking(self, prev_gray, curr_gray):
         print(f"[VisualFrontend] KLT Tracking")
+
+        need_recovery_klt = False
         # 追踪3d点2层/追踪2d点全层
         # 准备数据容器
         valid_3d_kp_ids = []
@@ -354,6 +357,9 @@ class VisualFrontend:
                 self.do_p3p = True
                 valid_2d_priors = valid_2d_kps_px
 
+            if nb_good_3d < 0.9 * len(valid_3d_kps_px):
+                need_recovery_klt = True
+
         # ---------------------------------------------------------
         # Step 2: 跟踪未带有先验的 2D 点
         # ---------------------------------------------------------
@@ -436,7 +442,7 @@ class VisualFrontend:
             self.tracking_kp_ids = all_kp_ids  # 保存ID用于内点映射
             self.tracking_is_3d = all_is_3d_array  # 保存3D/2D标记
         
-        return nb_good_3d
+        return nb_good_3d, need_recovery_klt
     
     def epipolar_filtering(self, n_tracked_valid_3d):
         """
@@ -638,6 +644,7 @@ class VisualFrontend:
         # TODO：单目模式下的位姿恢复（这里可以直接考虑替换VGGT）
         # 如果是单目且跟踪点少，尝试用 E 分解出的 R, t 替换当前位姿
         if(do_optimize and len(self.map_manager.keyframes) > 2):
+            print(f"[VisualFrontEnd Epipolar Filtering] Using motion optimization for pose recovery n_tracked_valid_3d: {n_tracked_valid_3d}")
             T_ref_w = ref_kf.get_T_c_w()
             T_w_cur = self.cur_frame.get_T_w_c()
             T_ref_cur = T_ref_w @ T_w_cur

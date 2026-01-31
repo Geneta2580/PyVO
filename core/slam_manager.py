@@ -52,20 +52,28 @@ class SLAMManager:
             self.viewer = None
         
         self.is_running = True
-
+   
     def start_all_threads(self):
         self.is_running = True
+
+        self.optimizer.start()
+        print("[SLAMManager] Optimizer thread started.")
+        
         if self.viewer is not None:
             self.viewer.start()
-            print("[SLAMManager] All threads started.")
+            print("[SLAMManager] Viewer thread started.")
         else:
             print("[SLAMManager] Viewer not initialized, skipping thread start.")
 
     def stop_all_threads(self):
         self.is_running = False
+        
+        self.optimizer.stop()
+        print("[SLAMManager] Optimizer thread stopped.")
+
         if self.viewer is not None:
             self.viewer.stop()
-            print("[SLAMManager] All threads stopped.")
+            print("[SLAMManager] Viewer thread stopped.")
         else:
             print("[SLAMManager] Viewer not initialized, skipping thread stop.")
 
@@ -94,7 +102,8 @@ class SLAMManager:
         self.frame_id += 1
 
         # 进行视觉前端追踪（KLT追踪、PnP计算位姿）
-        is_keyframe, curr_gray = self.visual_frontend.visual_tracking(self.prev_frame, self.cur_frame, timestamp)
+        need_recovery = False
+        is_keyframe, curr_gray, need_recovery = self.visual_frontend.visual_tracking(self.prev_frame, self.cur_frame, timestamp)
 
         # 检查是否是初始化失败（返回 False 且 visual_init_ready 为 False）
         if not is_keyframe and not self.visual_frontend.visual_init_ready:
@@ -192,8 +201,8 @@ class SLAMManager:
 
             # BA优化
             if n_keyframes > 2:
-                self.optimizer.optimize(self.cur_frame)
-                self.map_manager.map_filtering(self.cur_frame)
+                print(f"[SLAMManager] Requesting optimization for KF {self.cur_frame.get_id()}")
+                self.optimizer.request_optimization(self.cur_frame)
 
             # 检查初始化质量（初始化完成后(至少两帧，防止重置死循环)，第一个滑窗满之前，检查地图点数量）
             if 2 < n_keyframes < 10:

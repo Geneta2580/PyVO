@@ -1,13 +1,21 @@
+import threading
+import queue
 import numpy as np
 import gtsam
 from gtsam.symbol_shorthand import X, L
 import time
 
-class Optimizer:
+class Optimizer(threading.Thread):
     def __init__(self, config, map_manager):
+        super().__init__(name="Optimizer") # 命名线程，方便调试
         self.config = config
         self.map_manager = map_manager # 持有全局 MapManager 引用
         
+        # --- 线程控制 ---
+        self.request_queue = queue.Queue() # 任务队列
+        self.stop_signal = threading.Event() # 停止信号
+        self.daemon = True # 设置为守护线程，主程序退出时自动结束
+
         # 1. 噪声参数配置
         # 视觉观测噪声 (像素单位)
         sigma_px = 1.0
@@ -21,7 +29,8 @@ class Optimizer:
         )
 
         # 锚点帧噪声 (用于固定锚点帧)
-        self.pose_noise_fix = gtsam.noiseModel.Constrained.All(6)
+        self.pose_noise_fix = gtsam.noiseModel.Isotropic.Precision(6, 1e12)
+        # self.pose_noise_fix =  gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-5]*3 + [1e-5]*3))
 
         # 优化误差 Chi-square 阈值
         self.chi2_threshold = 5.9915 
@@ -42,11 +51,52 @@ class Optimizer:
         # 3. 外参 (单目 VO 优化的是 Camera Pose，故 Body_P_Sensor 为 Identity)
         self.body_T_cam = gtsam.Pose3(np.eye(4)) 
 
-    def optimize(self, new_kf):
+    def stop(self):
+        print("[Optimizer] Stopping thread...")
+        self.stop_signal.set()
+        if self.is_alive():
+            self.join()
+
+    def request_optimization(self, new_kf):
+        """
+        前端调用此方法，将新关键帧放入队列。
+        这是非阻塞的，前端调用完立刻返回。
+        """
+        self.request_queue.put(new_kf)
+
+    def run(self):
+        """线程的主循环"""
+        print("[Optimizer] Thread started.")
+        
+        while not self.stop_signal.is_set():
+            try:
+                # 1. 从队列获取关键帧 (设置超时以便能响应 stop 信号)
+                new_kf = self.request_queue.get(timeout=0.1)
+                
+                # 再次检查停止信号
+                if self.stop_signal.is_set(): break
+                
+                # 2. 执行优化 (核心逻辑)
+                # 注意：这里需要处理异常，防止后端崩了导致整个程序退出
+                self._perform_optimization(new_kf)
+
+                self.map_manager.map_filtering(new_kf)
+                
+            except queue.Empty:
+                continue # 队列为空，继续循环
+            except Exception as e:
+                print(f"[Optimizer] Critical Error in optimization loop: {e}")
+                # 打印详细报错堆栈，方便调试
+                import traceback
+                traceback.print_exc()
+
+    def _perform_optimization(self, new_kf):
         # =========================================================================
         # Step 1: 从 MapManager 获取数据 (线程安全地获取副本或引用)
         # =========================================================================
-        cov_kfs_dict = new_kf.get_covisible_map()
+
+        # 拷贝共视图，防止迭代时前端修改
+        cov_kfs_dict = new_kf.get_covisible_map().copy()
 
         # 向共视图中添加自己
         cov_kfs_dict[new_kf.get_id()] = len(new_kf.get_visual_features())
@@ -67,7 +117,9 @@ class Optimizer:
             if score >= self.min_cov_score or kf_id == new_kf.get_id():
                 # 将这些KF观测到的点加入待优化列表
                 local_kfs.add(kf)
-                for mp_id in kf.get_visual_feature_ids():  
+                mp_ids = list(kf.get_visual_feature_ids())
+
+                for mp_id in mp_ids:  
                     mp = self.map_manager.get_map_point(mp_id)
                     if mp is not None and not mp.is_bad():
                         local_mps.add(mp)
@@ -145,7 +197,7 @@ class Optimizer:
             valid_factors_buffer = [] 
             valid_observing_kfs = []
 
-            obs_kf_ids = mp.get_observing_kf_ids()
+            obs_kf_ids = list(mp.get_observing_kf_ids())
 
             for kf_id in obs_kf_ids:
                 # 检查 1: 帧是否存在于窗口
@@ -167,10 +219,10 @@ class Optimizer:
                 try:
                     point_c = pose_w_c.transformTo(point_w)
                     # 【修改】将阈值从 0.05 改为 0.001，防止单目尺度过小导致误杀
-                    if point_c[2] < 0.3: 
+                    if point_c[2] < 0.3 and point_c[2] > 1000: 
                         stats['drop_depth'] += 1
                         # print(f"[Debug] MP {mp_id} in KF {kf_id} DROPPED: Depth {point_c[2]:.4f} < 0.001")
-                        continue 
+                        continue                     
                 except:
                     stats['drop_transform'] += 1
                     continue
@@ -239,11 +291,20 @@ class Optimizer:
         # Step 3: 一阶段优化
         # =========================================================================
         try:
+            
             params = gtsam.LevenbergMarquardtParams()
             params.setMaxIterations(5)
             params.setRelativeErrorTol(1e-3)
             params.setAbsoluteErrorTol(1e-3)
-            params.setVerbosityLM("SUMMARY") 
+            params.setVerbosityLM("SUMMARY")
+
+            # 测试脚本中这样写会快点
+            ordering = gtsam.Ordering()
+            # 1. 先消元 Points
+            for mid in added_points: ordering.push_back(L(mid))
+            # 2. 后消元 Poses
+            for kid in added_poses: ordering.push_back(X(kid))
+            params.setOrdering(ordering)
 
             t1 = time.time()
             optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial_estimate, params)
@@ -374,7 +435,7 @@ class Optimizer:
                 # 如果点在一阶段就挂了（比如发散了被移除），跳过
                 if not result.exists(L(mp_id)): continue
 
-                obs_kf_ids = mp.get_observing_kf_ids()
+                obs_kf_ids = list(mp.get_observing_kf_ids())
                 
                 # 收集该点的所有有效观测 (非 Outlier)
                 valid_factors_for_point = []

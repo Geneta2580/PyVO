@@ -5,7 +5,7 @@
 # euroc：/home/pangjunxiang/dataset/Euroc/MH_01_easy
 # tum：/home/pangjunxiang/dataset/TUM/freiburg1
 # kitti:
-dataset_path: "/home/geneta/dataset/source_dataset/euroc/MH_01_easy"
+dataset_path: "/home/geneta/dataset/source_dataset/euroc/MH_05_difficult"
 
 # 支持euroc\tum\kitti数据集
 dataset_type: "euroc"
@@ -57,12 +57,42 @@ ransac_err: 3.0
 init_parallax: 20.0
 
 # 关键帧最小视差
-keyframe_min_parallax: 20
+keyframe_min_parallax: 20.0
 
 # 三角化参数
 triangulation_max_reprojection_error: 3.0 # 新地图点三角化最大重投影误差
 triangulation_max_depth: 100 # 新地图点三角化最大深度
 triangulation_min_depth: 0.1 # 新地图点三角化最小深度
+
+# ============================================= VGGT配置参数 =============================================
+# 是否使用VGGT
+vggt_on: False
+
+# 初始化窗口大小
+vggt_init_window_size: 10
+
+# 跟踪窗口大小
+vggt_tracking_batch_size: 10
+
+# 重叠帧数
+vggt_overlap_num: 2
+
+# VGGT关键帧间隔（间隔多少个关键帧送入VGGT推理）
+# 0: 每个关键帧都送入（默认行为）
+# 1: 每隔1个关键帧送入（即第0,2,4,6...个关键帧）
+# 2: 每隔2个关键帧送入（即第0,3,6,9...个关键帧）
+vggt_keyframe_interval: 1
+
+# VGGT因子噪声sigma（和间隔帧相关）
+vggt_sigma_rot: 0.01
+vggt_sigma_pos: 0.03
+
+# GPU序号
+gpu_id: 0
+
+# VGGT模型路径
+vggt_model_path: "submodules/vggt/model.pt"
+
 
 # ============================================= 调试模式配置 =============================================
 # 单帧运行debug模式：设置为True时，每处理一帧后暂停，等待用户输入继续

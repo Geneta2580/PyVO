@@ -5,7 +5,7 @@
 # euroc：/home/pangjunxiang/dataset/Euroc/MH_01_easy
 # tum：/home/pangjunxiang/dataset/TUM/freiburg1
 # kitti:
-dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0027_sync"
+dataset_path: "/home/geneta/dataset/source_dataset/kitti/2011_09_30_drive_0018_sync"
 
 # 支持euroc\tum\kitti数据集
 dataset_type: "kitti"
@@ -30,7 +30,7 @@ image_height: 376
 max_features_to_detect: 300
 
 # 网格单元大小
-grid_cell_size: 30
+grid_cell_size: 35
 
 # 最大质量等级
 max_quality_level: 0.001
@@ -56,6 +56,9 @@ ransac_err: 3.0
 # 初始化判定视差阈值
 init_parallax: 20.0
 
+# 关键帧最小视差
+keyframe_min_parallax: 10
+
 # 三角化参数
 triangulation_max_reprojection_error: 3.0 # 新地图点三角化最大重投影误差
 triangulation_max_depth: 100 # 新地图点三角化最大深度
@@ -63,13 +66,13 @@ triangulation_min_depth: 0.1 # 新地图点三角化最小深度
 
 # ============================================= 调试模式配置 =============================================
 # 单帧运行debug模式：设置为True时，每处理一帧后暂停，等待用户输入继续
-debug_single_frame: True
+debug_single_frame: False
 
 # 可视化光流追踪结果：设置为True时，显示光流追踪的可视化结果
 visualize_optical_flow: True
 
 # open3d可视化
-use_viewer: True
+use_viewer: False
 # Open3D初始显示范围（单位：米），控制窗口的初始视图范围
 # 建议值：50-200（小场景），200-500（中等场景），500-1000（大场景）
 viewer_initial_range: 200.0
